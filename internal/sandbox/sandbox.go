@@ -35,8 +35,14 @@ type Spec struct {
 // when [Run] returns a nil error.
 type Result struct {
 	// ExitCode is the wrapped command's exit status, or -1 if it was
-	// terminated by a signal. Faithful reporting of *which* signal (and of
-	// self-signalled termination at all) waits on the PID-1 init shim built
-	// with syscall-capture; see DECISIONS.md 2026-09-01.
+	// terminated by a signal (reported over a side channel, since PID 1
+	// cannot re-raise a signal on itself — see DECISIONS.md 2026-09-05).
 	ExitCode int
+
+	// Report is the rendered plain-text behavior report for this run. It
+	// is generated in-namespace and handed back here as data — never
+	// written to the wrapped command's stdout/stderr, which [Run] keeps
+	// as an untouched pipe. The caller decides where it goes; cmd/cordon
+	// prints it to stderr. Empty only when the run never started.
+	Report string
 }

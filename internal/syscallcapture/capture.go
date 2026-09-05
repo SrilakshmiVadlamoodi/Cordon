@@ -26,6 +26,16 @@ type Result struct {
 	ExitCode int
 	// Signal is the signal that killed it, or 0 if it exited normally.
 	Signal syscall.Signal
+	// UnobservedDescendants is the count of distinct separate processes
+	// the traced program forked that were kept alive (so they don't
+	// ENOSYS) but never traced — the process-tree gap deferred to
+	// features/syscall-capture-tree. A forked process with its own
+	// thread pool counts once (grouped by Tgid). It is a *lower bound*:
+	// a task that exits before its /proc/<pid>/status can be read is not
+	// counted. behaviorreport surfaces this in the report so "what
+	// Cordon did not observe" is a real per-run number, not a generic
+	// line (INTENT.md §1: best-effort, and say so specifically).
+	UnobservedDescendants int
 }
 
 // Event is one captured syscall, with arguments resolved per

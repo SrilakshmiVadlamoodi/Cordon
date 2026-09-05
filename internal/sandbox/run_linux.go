@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/SrilakshmiVadlamoodi/cordon/internal/behaviorreport"
 	"github.com/SrilakshmiVadlamoodi/cordon/internal/syscallcapture"
 )
 
@@ -105,6 +106,19 @@ func Run(spec Spec) (Result, error) {
 	}
 	defer sigR.Close()
 
+	// repR/repW: the behavior report crosses back here as data on its own
+	// fd, never on the wrapped command's stdout/stderr — those stay an
+	// untouched pipe (TestRun_PassesThroughStdoutAndStderrUnchanged). The
+	// report is small and bounded (behaviorreport caps its finding
+	// count), so a plain read after Wait cannot deadlock on the pipe
+	// buffer.
+	repR, repW, err := os.Pipe()
+	if err != nil {
+		sigW.Close()
+		return Result{}, fmt.Errorf("sandbox.Run: creating report pipe: %w", err)
+	}
+	defer repR.Close()
+
 	// Re-exec ourselves. The child re-enters this binary, MaybeRunChild
 	// sees the sentinel, and it takes over inside the new namespaces.
 	cmd := exec.Command("/proc/self/exe")
@@ -113,11 +127,11 @@ func Run(spec Spec) (Result, error) {
 	cmd.Stdin = orReader(spec.Stdin, os.Stdin)
 	cmd.Stdout = orWriter(spec.Stdout, os.Stdout)
 	cmd.Stderr = orWriter(spec.Stderr, os.Stderr)
-	// ExtraFiles entries land at fd 3, 4, ... in the child in order — this
-	// is the one and only extra fd, so it's fd 3. runChild marks its own
-	// copy close-on-exec immediately, so it never reaches the tracee
+	// ExtraFiles entries land at fd 3, 4, ... in the child in order:
+	// fd 3 = signal-death report, fd 4 = behavior report. runChild marks
+	// both close-on-exec immediately, so neither reaches the tracee
 	// helper or the wrapped command themselves.
-	cmd.ExtraFiles = []*os.File{sigW}
+	cmd.ExtraFiles = []*os.File{sigW, repW}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: namespaceFlags,
 		// Map our host UID/GID to root inside the new user namespace.
@@ -131,20 +145,22 @@ func Run(spec Spec) (Result, error) {
 
 	if err := cmd.Start(); err != nil {
 		sigW.Close()
+		repW.Close()
 		return Result{}, fmt.Errorf("sandbox.Run: starting sandbox child: %w", err)
 	}
-	// Our copy of the write end must close now, not after Wait: the read
-	// below blocks until every copy of the write end is closed, and
-	// runChild's own copy only closes when runChild itself exits.
+	// Our copies of the write ends must close now, not after Wait: the
+	// reads below block until every copy of a write end is closed, and
+	// runChild's own copies only close when runChild itself exits.
 	sigW.Close()
+	repW.Close()
 
 	runErr := cmd.Wait()
 
-	// A non-empty read means runChild reported a signal death over the
-	// pipe; an empty one (EOF with no data) means it exited normally —
-	// either way, the write end is guaranteed closed by now (runChild has
-	// exited, by construction of Wait returning), so this cannot block.
+	// Both reads are safe now: the write ends are held only by runChild,
+	// which has exited (Wait returned), and both payloads are bounded
+	// well under the pipe buffer.
 	sigReport, _ := io.ReadAll(sigR)
+	report, _ := io.ReadAll(repR)
 
 	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
 	if !ok {
@@ -157,7 +173,7 @@ func Run(spec Spec) (Result, error) {
 		// runChild itself (e.g. a host-level SIGKILL) — PID 1 immunity
 		// only applies to same-namespace senders, so that path still
 		// works exactly as before.
-		return Result{ExitCode: -1}, nil
+		return Result{ExitCode: -1, Report: string(report)}, nil
 	}
 	// A non-zero exit surfaces as *exec.ExitError; that is a normal Result,
 	// not a Run failure. Anything else means we never launched the child.
@@ -167,7 +183,7 @@ func Run(spec Spec) (Result, error) {
 			return Result{}, fmt.Errorf("sandbox.Run: launching sandbox child: %w", runErr)
 		}
 	}
-	return Result{ExitCode: ws.ExitStatus()}, nil
+	return Result{ExitCode: ws.ExitStatus(), Report: string(report)}, nil
 }
 
 // MaybeRunChild takes over the process when it has been re-exec'd as the
@@ -201,16 +217,18 @@ func runChild(cfg childConfig) {
 	// Keep the sentinel out of the wrapped command's environment.
 	os.Unsetenv(childEnvVar)
 
-	// fd 3 is the write end of sandbox.Run's signal-report pipe (see its
-	// doc comment). Marked close-on-exec immediately: this process still
-	// has two exec's ahead of it (syscallcapture's tracee helper, then
-	// the wrapped command itself), and neither of those — least of all
-	// the wrapped, untrusted command — should inherit a writable fd into
-	// our own signal-report channel. That would be a robustness hole
-	// (a wrapped command writing garbage here could confuse the report),
-	// not a sandbox escape, but there is no reason to leave it open.
+	// fd 3 and fd 4 are the write ends of sandbox.Run's two side channels
+	// (signal-death report, behavior report). Both marked close-on-exec
+	// immediately: this process still has two exec's ahead of it
+	// (syscallcapture's tracee helper, then the wrapped command), and
+	// neither — least of all the wrapped, untrusted command — should
+	// inherit a writable fd into our own reporting channels. Not a
+	// sandbox escape, but a robustness hole (garbage written to either
+	// could confuse a report) with no reason to leave it open.
 	sigPipe := os.NewFile(3, "cordon-sigpipe")
 	syscall.CloseOnExec(3)
+	reportPipe := os.NewFile(4, "cordon-reportpipe")
+	syscall.CloseOnExec(4)
 
 	if err := setupRootfs(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "cordon child: sandbox setup: %v\n", err)
@@ -225,15 +243,27 @@ func runChild(cfg childConfig) {
 		os.Exit(127)
 	}
 
+	// Collect captured events cheaply (append-only; classification is
+	// deferred), then generate the report here in this process and write
+	// it back to sandbox.Run over fd 4 — never to the wrapped command's
+	// stdout/stderr, which stay an untouched pipe. Composing it here
+	// rather than streaming raw events back out keeps the wiring minimal
+	// for the MVP (the report is small plain text); a raw-events channel
+	// is the refactor if a non-text consumer ever appears (DECISIONS.md
+	// 2026-09-05 "behavior-report MVP: report as Result data, on fd 4").
+	var collector behaviorreport.Collector
 	res, err := syscallcapture.Run(syscallcapture.Config{
 		Argv0: argv0,
 		Argv:  cfg.Command,
 		Envp:  childEnv(cfg),
-	}, nil) // no event consumer yet — behavior-report is a later feature
+	}, collector.OnEvent)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cordon child: %v\n", err)
 		os.Exit(125)
 	}
+
+	behaviorreport.Generate(collector.Events, res.UnobservedDescendants).WriteText(reportPipe)
+	reportPipe.Close()
 
 	if res.Signal != 0 {
 		// The wrapped command (PID 2, not PID 1) died by signal. This

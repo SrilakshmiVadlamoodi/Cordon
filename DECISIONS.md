@@ -1696,3 +1696,162 @@ non-amd64 Linux target, on purpose, with a self-explanatory error. For a
 tool whose entire job is observing what a process does, a binary that
 builds but silently observes nothing is a worse outcome than a build that
 refuses to happen at all."
+
+---
+
+## [2026-09-05] behavior-report MVP: two rules, report as Result data on its own fd, corpus synthetic
+
+**Context:** `features/behavior-report/intent.md` — turn captured
+`syscallcapture.Event`s into a plain-text diagnosis. Explicitly scoped
+crude ("severity tiers may be crude here; the real taxonomy is Phase 2
+work"), and gated on a 5-package corpus that did not exist in the repo.
+
+**Where the report is generated, and how it gets out.** `onEvent` is
+called synchronously from inside the ptrace loop and blocks the tracee
+until it returns, so the consumer (`behaviorreport.Collector`) only
+appends; all classification runs in a batch pass after
+`syscallcapture.Run` returns. That batch pass runs inside `runChild`
+(the in-namespace PID 1), not out in `cmd/cordon` — events live there and
+never cross a process boundary as structured data. The rendered report
+does cross back, as `sandbox.Result.Report` (a string), over a dedicated
+pipe fd (fd 4, alongside fd 3's signal-death channel), read after
+`cmd.Wait`.
+
+- Rejected: writing the report to `runChild`'s stdout. That broke
+  `TestRun_PassesThroughStdoutAndStderrUnchanged` — the sandbox's I/O
+  transparency is a real, tested contract, and the report is not the
+  wrapped command's output.
+- Rejected (for now): streaming raw events back to `cmd/cordon` over a
+  pipe and composing the report there — the "clean layering" option. It
+  needs a concurrent reader goroutine (a full npm install's ~8k events
+  would overflow the 64 KB pipe buffer if read only after Wait) and
+  per-event JSON framing. The rendered report, by contrast, is small and
+  bounded (`WriteText` caps the finding list at 100), so a plain
+  read-after-Wait cannot deadlock. `internal/sandbox` importing
+  `internal/behaviorreport` is the cost; the raw-events channel is the
+  refactor if a non-text consumer (Phase 2 JSON, a library caller) ever
+  appears.
+
+**stdout vs. stderr.** `cmd/cordon` prints `Result.Report` to **stderr**.
+`intent.md` says "stdout". The deviation is deliberate: the wrapped
+command owns stdout (so `cordon run npm ci > deps.log` keeps npm's output
+uncontaminated), and the report is Cordon's own diagnostic *about* the
+run, which conventionally goes to stderr. Read `intent.md`'s "plain text
+to stdout only — no JSON schema, no HTML, no dashboard" as a statement
+about *format* (plain text, not a structured/UI output), which is
+honored; the stream choice is not the design intent it was expressing.
+
+**The taxonomy: two rules, and where HIGH is drawn.**
+- **Rule 1 — credential-read → HIGH.** An `openat` whose path contains
+  one of a short, explicit list of secret-store markers (`/.ssh/id_*`,
+  `/.aws/credentials`, `/.npmrc`, `/.netrc`, `/.git-credentials`,
+  `/.docker/config.json`, `/.gnupg/`, shell history, gcloud creds). One
+  finding per distinct path. Fires on the *attempt* — success and any
+  follow-on network activity are irrelevant to it. This is the reliable
+  HIGH: it does not depend on the process-tree gap (credential-reading
+  code runs in the package's own process, e.g. `fs.readFile` in its
+  postinstall, not a forked child), and a legitimate native build has no
+  reason to trip it.
+- **Rule 2 — network egress → MEDIUM, escalates to HIGH only paired with
+  a credential-read.** Each distinct `connect` target is a MEDIUM
+  finding on its own. Plain "any connect = HIGH" was rejected: a
+  legitimate `node-gyp` downloads Node headers, a real connection with no
+  way to tell it from something bad without hostname resolution (a
+  documented capture gap) or an allowlist (explicitly Phase 2). When a
+  credential-read finding *also* exists this run, one HIGH "possible
+  credential exfiltration" finding is added, correlating the two —
+  wording is careful that Cordon cannot prove data flowed from file to
+  socket, only that both happened.
+- No exec-based rule. Under single-process tracing, "download and run"
+  is almost always a *forked child's* `execve`, invisible — an exec rule
+  would be mostly dead weight until `syscall-capture-tree`.
+
+**Corpus: synthetic, six fixtures under `testdata/corpus/`.** Not real
+pulled-from-the-registry malware — same reasoning as the overhead fixture
+(safety, reproducibility, and "explain every line" beats
+reverse-engineering). Each is a small Go `main.go` plus a `README.md`
+stating what it models, which rule it exercises, and — for
+`credential-read-no-network` — what it explicitly does *not* prove (that
+Rule 1 avoids false-positiving on a legit token-free project-local
+`.npmrc`; it does not, the rule matches the path not the contents, and
+that gap is Phase 2's). The sixth fixture (`bare-network-connect`) was
+added to isolate "MEDIUM stays MEDIUM standalone" from `faux-node-gyp`'s
+combined network+subprocess case. `.npmrc` in the marker list is the
+loosest entry and a known false-positive shape — kept, flagged in the
+rule comment and the corpus README, tracked for Phase 2.
+
+**Consequences:**
+- `behavior-report`'s Done checklist is satisfiable and tested end-to-end
+  (`cmd/cordon/corpus_test.go` runs each fixture through the real binary
+  and asserts on the report text) plus unit-tested
+  (`internal/behaviorreport/report_test.go`, hand-built event slices, no
+  sandbox).
+- `sandbox.Result` grew a `Report string` field — a real public API
+  addition, justified by an actual consumer (`cmd/cordon`), consistent
+  with the project's build-it-when-needed pattern.
+- The stdout→stderr choice means `cordon run foo | grep HIGH` won't work;
+  a `--report-to-stdout` flag or the Phase 3 Action wrapper is where
+  that gets revisited.
+
+**If asked to defend this:** "Two rules — a secret-file open is HIGH on
+its own because a legit build never does it and it doesn't depend on
+tracing child processes; a network connection is MEDIUM unless a secret
+was also read this run, then the pair is flagged HIGH with wording that's
+explicit we can't prove exfiltration, only correlation. The report is
+generated inside the sandbox where the events are, handed back as a
+string on its own pipe fd so the wrapped command's stdout stays clean,
+and printed to stderr because it's Cordon's diagnostic, not the
+program's output. Corpus is six synthetic fixtures modeling the worm
+pattern from our own mission statement, each with a README saying what it
+does and doesn't prove."
+
+---
+
+## [2026-09-05] UnobservedDescendants: a concrete instance of INTENT §1's "best-effort, and say so specifically"
+
+**Context:** INTENT.md §1 requires that Cordon "publish measured
+coverage; never claim completeness," and `behavior-report/intent.md`
+requires the report to state "plainly what Cordon did *not* observe."
+The easy way to satisfy that is a fixed disclaimer paragraph. This entry
+is about doing better than that in one specific, cheap place.
+
+**What was added:** `syscallcapture.Result.UnobservedDescendants int` —
+the count of distinct thread-groups (`Tgid`s) that were auto-attached but
+never traced: the separate processes the install forked, which the
+process-tree gap (`syscall-capture-tree`) leaves unobserved. The
+dispatch loop already reads each new task's `Tgid` to tell a sibling
+thread of the traced process (observed) from a separate process (not);
+recording the distinct non-primary `Tgid`s alongside that is nearly free.
+`behaviorreport` turns it into a per-run line: *"3 other process(es)
+were launched during this run and were NOT traced"*, or a "no separate
+processes were launched" line when the count is 0.
+
+**Why this is the principle, not just a feature:** "detection is
+best-effort" is easy to write and easy to make vacuous. A generic
+"Cordon may miss things" line tells a user nothing actionable. "This run
+forked 3 processes we didn't watch" tells them exactly how much of *this
+install* was outside the lens — a number they can weigh. Same idea,
+made specific and per-run, using data already in hand. When a future
+gap is similarly cheap to quantify, quantify it the same way rather than
+adding a sentence to the disclaimer.
+
+**Two honesty caveats, both in the doc comment:**
+- It is a **lower bound**. A task that exits before its
+  `/proc/<pid>/status` can be read returns `Tgid` 0 and is not counted.
+- It counts *every* distinct forked thread-group, including ones the
+  wrapped program's own runtime spawns for its own reasons — found
+  concretely while testing `faux-node-gyp`: two `exec.Command` calls
+  produced a count of **3**, because Go's runtime does a one-time
+  `clone(CLONE_PIDFD)` support probe (a short-lived throwaway child) on
+  first `os/exec` use. The count is an honest "processes we saw and did
+  not trace", not a curated "subprocesses you asked for" — the corpus
+  test asserts `>= 2`, and the fixture README explains the discrepancy.
+
+**If asked to defend this:** "The intent docs say be best-effort and say
+so. The weak version of that is a boilerplate disclaimer. The strong
+version, where it's cheap, is a real per-run number: this install forked
+N processes we didn't trace. We already read each task's thread-group id
+to classify it, so counting the distinct un-traced ones costs almost
+nothing, and it's a far more useful thing to tell a developer than 'we
+might miss stuff'. It's a lower bound, and it includes a process the Go
+runtime forks for its own reasons — both stated in the code, not hidden."

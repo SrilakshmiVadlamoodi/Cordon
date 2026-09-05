@@ -171,6 +171,15 @@ func Run(cfg Config, onEvent func(Event)) (Result, error) {
 	// a false positive would mean misattributing another process's
 	// events, which this default rules out.
 	observed := map[int]bool{pid: true}
+	// unobservedTgids collects the distinct thread-group ids of every
+	// task we auto-attach but never read — i.e. separate processes the
+	// traced program forked (and their own threads, folded in by Tgid so
+	// a forked process with its own thread pool counts once). Its size
+	// becomes Result.UnobservedDescendants, which behaviorreport turns
+	// into the report's "N other processes were launched and not traced"
+	// line — a real, per-run statement of a real gap, not a generic
+	// disclaimer.
+	unobservedTgids := map[int]bool{}
 	var result Result
 
 	for {
@@ -200,6 +209,7 @@ func Run(cfg Config, onEvent func(Event)) (Result, error) {
 				} else {
 					result = Result{Signal: ws.Signal()}
 				}
+				result.UnobservedDescendants = len(unobservedTgids)
 				drainExitedDescendants()
 				return result, nil
 			}
@@ -220,8 +230,22 @@ func Run(cfg Config, onEvent func(Event)) (Result, error) {
 				// doc comment), then let it run.
 				known[wpid] = true
 				_ = syscall.PtraceSetOptions(wpid, opts)
-				if sameThreadGroup(wpid, pid) {
+				switch tgid := threadGroupOf(wpid); {
+				case tgid == pid:
+					// A sibling OS thread of the traced process — observe
+					// it exactly as the primary (DECISIONS.md 2026-09-04).
 					observed[wpid] = true
+				case tgid > 0:
+					// A separate forked process (or one of its own
+					// threads). Not traced this slice; recorded so the
+					// report can say so. Note this counts *every* distinct
+					// forked thread-group, including short-lived ones the
+					// wrapped program's own runtime spawns for its own
+					// reasons (e.g. Go's one-time clone(CLONE_PIDFD)
+					// support probe on first os/exec) — the number is an
+					// honest "processes we saw and did not trace", not a
+					// curated "subprocesses you asked for".
+					unobservedTgids[tgid] = true
 				}
 				_ = syscall.PtraceCont(wpid, 0)
 				continue
@@ -285,26 +309,29 @@ func drainExitedDescendants() {
 	}
 }
 
-// sameThreadGroup reports whether wpid is a member of primaryPid's thread
-// group — i.e. a sibling OS thread of that process, not a separate
-// process — by reading wpid's own Tgid out of /proc. A read failure
-// (e.g. wpid already exited) reports false, the safe default: see
-// observed's doc comment in Run for why an unclassified task defaults to
-// "not a sibling thread" rather than the other way around.
-func sameThreadGroup(wpid, primaryPid int) bool {
+// threadGroupOf reads wpid's own Tgid out of /proc, or returns 0 if that
+// read fails (e.g. wpid already exited). Callers treat 0 as "unknown" and
+// default it to the safe direction — see observed's doc comment in Run
+// for why an unclassified task is "not a sibling thread" rather than the
+// other way around, and Result.UnobservedDescendants' doc comment for
+// why a 0 here makes the descendant count a lower bound.
+func threadGroupOf(wpid int) int {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", wpid))
 	if err != nil {
-		return false
+		return 0
 	}
-	prefix := []byte("Tgid:")
+	const prefix = "Tgid:"
 	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "Tgid:") {
+		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
 		tgid, err := strconv.Atoi(strings.TrimSpace(line[len(prefix):]))
-		return err == nil && tgid == primaryPid
+		if err != nil {
+			return 0
+		}
+		return tgid
 	}
-	return false
+	return 0
 }
 
 // handleSeccompStop reads the trapped syscall's number and arguments and

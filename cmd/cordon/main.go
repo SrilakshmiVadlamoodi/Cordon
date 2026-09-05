@@ -48,6 +48,15 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "cordon:", err)
 		return 1
 	}
+
+	// The behavior report goes to stderr, not stdout: the wrapped
+	// command owns stdout (so `cordon run npm ci > deps.log` keeps npm's
+	// output clean), and the report is Cordon's own diagnostic *about*
+	// the run. intent.md says "stdout"; the deviation and its reasoning
+	// are logged in DECISIONS.md 2026-09-05.
+	if res.Report != "" {
+		fmt.Fprint(os.Stderr, res.Report)
+	}
 	// res.ExitCode is -1 when the command died from a signal; os.Exit maps
 	// that to 255. Faithful 128+signum semantics arrive with the init shim
 	// (DECISIONS.md 2026-09-01).
