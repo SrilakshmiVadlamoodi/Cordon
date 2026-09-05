@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+
+	"github.com/SrilakshmiVadlamoodi/cordon/internal/syscallcapture"
 )
 
 // childEnvVar carries the JSON-encoded childConfig from the parent Run call
@@ -140,7 +142,15 @@ func MaybeRunChild() {
 }
 
 // runChild executes inside the new namespaces: it builds the isolated root
-// filesystem, then execve's the wrapped command.
+// filesystem, then hands off to syscallcapture as PID 1 of the namespace.
+//
+// It used to end in a direct syscall.Exec of the wrapped command, making
+// that command itself PID 1 — see DECISIONS.md 2026-09-01 for why that
+// made signal delivery to it unreliable, and DECISIONS.md 2026-09-04 for
+// why this changed and what it costs. This process now stays alive for
+// the wrapped command's whole run: syscallcapture.Run launches it as a
+// real child (PID 2) via ptrace's PTRACE_TRACEME, so runChild becomes its
+// tracer and reaper rather than replacing itself with it.
 func runChild(cfg childConfig) {
 	// Keep the sentinel out of the wrapped command's environment.
 	os.Unsetenv(childEnvVar)
@@ -158,11 +168,29 @@ func runChild(cfg childConfig) {
 		os.Exit(127)
 	}
 
-	// execve replaces this process image, so no Go code runs in the
-	// target and its exit status flows straight back to the parent.
-	err = syscall.Exec(argv0, cfg.Command, childEnv(cfg))
-	fmt.Fprintf(os.Stderr, "cordon child: exec %s: %v\n", argv0, err)
-	os.Exit(126)
+	res, err := syscallcapture.Run(syscallcapture.Config{
+		Argv0: argv0,
+		Argv:  cfg.Command,
+		Envp:  childEnv(cfg),
+	}, nil) // no event consumer yet — behavior-report is a later feature
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cordon child: %v\n", err)
+		os.Exit(125)
+	}
+
+	if res.Signal != 0 {
+		// The wrapped command (PID 2, not PID 1 — unlike the old direct
+		// exec, it is not immune to its own signals) died by signal.
+		// Die by the same signal ourselves, as PID 1, so the outer
+		// wait4 in sandbox.Run sees a faithful Signaled() status. We
+		// never call signal.Notify for anything, so this signal's
+		// default disposition (terminate) still applies to us.
+		syscall.Kill(os.Getpid(), res.Signal)
+		// Should not be reached for a genuinely fatal signal; fall back
+		// to a conventional exit code rather than hang if it somehow is.
+		os.Exit(128 + int(res.Signal))
+	}
+	os.Exit(res.ExitCode)
 }
 
 // setupRootfs constructs the sandbox root filesystem in the child's mount
