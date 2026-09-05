@@ -85,6 +85,26 @@ func Run(spec Spec) (Result, error) {
 		return Result{}, fmt.Errorf("sandbox.Run: encoding child config: %w", err)
 	}
 
+	// sigR/sigW: a side channel for runChild (PID 1 of the new namespace)
+	// to report the wrapped command's signal death back to us, since it
+	// cannot do that by re-raising the signal on itself — the kernel
+	// marks any namespace's PID 1 SIGNAL_UNKILLABLE, so a same-namespace
+	// self-kill for a SIG_DFL-terminate signal is silently dropped
+	// (DECISIONS.md 2026-09-05 "PID 1 signal re-raise is silently
+	// dropped by the kernel" — verified: without this channel,
+	// `cordon run sh -c 'kill -TERM $$'` reported ExitCode 143, not -1).
+	// A sentinel exit code (e.g. 128+signal) was considered instead and
+	// rejected: the wrapped command is arbitrary, untrusted input, and a
+	// program that legitimately exits with a code in that same range for
+	// its own reasons would be misreported as a signal death. The pipe
+	// carries the report on a channel with no exit-code collision surface
+	// at all.
+	sigR, sigW, err := os.Pipe()
+	if err != nil {
+		return Result{}, fmt.Errorf("sandbox.Run: creating signal-report pipe: %w", err)
+	}
+	defer sigR.Close()
+
 	// Re-exec ourselves. The child re-enters this binary, MaybeRunChild
 	// sees the sentinel, and it takes over inside the new namespaces.
 	cmd := exec.Command("/proc/self/exe")
@@ -93,6 +113,11 @@ func Run(spec Spec) (Result, error) {
 	cmd.Stdin = orReader(spec.Stdin, os.Stdin)
 	cmd.Stdout = orWriter(spec.Stdout, os.Stdout)
 	cmd.Stderr = orWriter(spec.Stderr, os.Stderr)
+	// ExtraFiles entries land at fd 3, 4, ... in the child in order — this
+	// is the one and only extra fd, so it's fd 3. runChild marks its own
+	// copy close-on-exec immediately, so it never reaches the tracee
+	// helper or the wrapped command themselves.
+	cmd.ExtraFiles = []*os.File{sigW}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: namespaceFlags,
 		// Map our host UID/GID to root inside the new user namespace.
@@ -104,13 +129,34 @@ func Run(spec Spec) (Result, error) {
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
 	}
 
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		sigW.Close()
+		return Result{}, fmt.Errorf("sandbox.Run: starting sandbox child: %w", err)
+	}
+	// Our copy of the write end must close now, not after Wait: the read
+	// below blocks until every copy of the write end is closed, and
+	// runChild's own copy only closes when runChild itself exits.
+	sigW.Close()
+
+	runErr := cmd.Wait()
+
+	// A non-empty read means runChild reported a signal death over the
+	// pipe; an empty one (EOF with no data) means it exited normally —
+	// either way, the write end is guaranteed closed by now (runChild has
+	// exited, by construction of Wait returning), so this cannot block.
+	sigReport, _ := io.ReadAll(sigR)
 
 	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
 	if !ok {
 		return Result{}, fmt.Errorf("sandbox.Run: missing wait status (run error: %v)", runErr)
 	}
-	if ws.Signaled() {
+	if len(sigReport) > 0 || ws.Signaled() {
+		// The pipe report covers the wrapped command dying by signal
+		// (the common case); ws.Signaled() still covers the separate
+		// case of something outside the namespace actually killing
+		// runChild itself (e.g. a host-level SIGKILL) — PID 1 immunity
+		// only applies to same-namespace senders, so that path still
+		// works exactly as before.
 		return Result{ExitCode: -1}, nil
 	}
 	// A non-zero exit surfaces as *exec.ExitError; that is a normal Result,
@@ -155,6 +201,17 @@ func runChild(cfg childConfig) {
 	// Keep the sentinel out of the wrapped command's environment.
 	os.Unsetenv(childEnvVar)
 
+	// fd 3 is the write end of sandbox.Run's signal-report pipe (see its
+	// doc comment). Marked close-on-exec immediately: this process still
+	// has two exec's ahead of it (syscallcapture's tracee helper, then
+	// the wrapped command itself), and neither of those — least of all
+	// the wrapped, untrusted command — should inherit a writable fd into
+	// our own signal-report channel. That would be a robustness hole
+	// (a wrapped command writing garbage here could confuse the report),
+	// not a sandbox escape, but there is no reason to leave it open.
+	sigPipe := os.NewFile(3, "cordon-sigpipe")
+	syscall.CloseOnExec(3)
+
 	if err := setupRootfs(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "cordon child: sandbox setup: %v\n", err)
 		os.Exit(125)
@@ -179,17 +236,22 @@ func runChild(cfg childConfig) {
 	}
 
 	if res.Signal != 0 {
-		// The wrapped command (PID 2, not PID 1 — unlike the old direct
-		// exec, it is not immune to its own signals) died by signal.
-		// Die by the same signal ourselves, as PID 1, so the outer
-		// wait4 in sandbox.Run sees a faithful Signaled() status. We
-		// never call signal.Notify for anything, so this signal's
-		// default disposition (terminate) still applies to us.
-		syscall.Kill(os.Getpid(), res.Signal)
-		// Should not be reached for a genuinely fatal signal; fall back
-		// to a conventional exit code rather than hang if it somehow is.
+		// The wrapped command (PID 2, not PID 1) died by signal. This
+		// process *can't* faithfully re-signal itself to report that:
+		// as PID 1 of its own namespace it is SIGNAL_UNKILLABLE against
+		// same-namespace senders, so a self-kill for a SIG_DFL-terminate
+		// signal is silently dropped by the kernel — verified directly
+		// (DECISIONS.md 2026-09-05), not assumed. Report over the pipe
+		// instead, which sandbox.Run decodes back into ExitCode: -1.
+		fmt.Fprintf(sigPipe, "%d\n", int(res.Signal))
+		sigPipe.Close()
+		// This process's own exit code is no longer load-bearing for
+		// correctness — sandbox.Run decides from the pipe, not this —
+		// but 128+signal is kept as a human-readable convention for
+		// anyone inspecting this process directly (ps, strace).
 		os.Exit(128 + int(res.Signal))
 	}
+	sigPipe.Close()
 	os.Exit(res.ExitCode)
 }
 

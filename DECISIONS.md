@@ -1505,3 +1505,194 @@ luck. Also found that those descendant processes spin up their own
 thread pools too, which `syscall-capture-tree` will need to account for
 specifically, not just fork/exec — real information this check produced,
 not just a green light."
+
+---
+
+## [2026-09-05] PID 1 signal re-raise is silently dropped by the kernel — fixed with a pipe, not a sentinel exit code
+
+**Context:** `/code-review ultra`, run against the `syscall-capture` branch, found that `runChild`'s
+signal-death handling — added in the 2026-09-04 PID-1 rewrite — doesn't
+work. That code re-raises the wrapped command's signal on itself
+(`syscall.Kill(os.Getpid(), res.Signal)`) so the outer `sandbox.Run`'s
+`wait4` sees a faithful `Signaled()` status. But `runChild` is now PID 1
+of its own namespace, and the kernel marks any namespace's PID 1
+`SIGNAL_UNKILLABLE` against same-namespace senders — exactly the
+immunity the *original* 2026-09-01 PID-1 entry documented for the old
+design, which the 2026-09-04 rewrite reintroduced for `runChild` itself
+without noticing. Verified directly, not just argued: `cordon run sh -c
+'kill -TERM $$'` reported `Result{ExitCode: 143}` (the `os.Exit(128+sig)`
+fallback), not `-1` — silently violating `Result.ExitCode`'s own doc
+comment and the previous rewrite entry's claim that "the exit-code
+contract needed no changes."
+
+**Options considered:**
+- **Sentinel exit code** (e.g. `runChild` exits `128+signal`; `sandbox.Run`
+  decodes that range back into `ExitCode: -1`). The obvious first idea —
+  it's exactly what the fallback line already did, just promoted to the
+  primary mechanism. Rejected: the wrapped command is arbitrary,
+  untrusted input, and `128+N`-range exit codes are a real convention
+  some programs use intentionally for reasons unrelated to any actual
+  signal. A wrapped command that legitimately calls `exit(143)` for its
+  own reasons would be misreported as a `SIGTERM` death. Given Cordon's
+  entire purpose is running untrusted install scripts, "an adversarial or
+  just unlucky wrapped command could collide with our sentinel" isn't an
+  acceptable residual risk for a reporting contract with a documented,
+  specific guarantee.
+- **A pipe side-channel, separate from the exit code entirely** (chosen).
+  `sandbox.Run` creates a pipe, passes the write end to the re-exec'd
+  child via `cmd.ExtraFiles` (landing at fd 3), and closes its own copy
+  right after `Start()`. `runChild` marks its copy close-on-exec
+  immediately (so neither the tracee helper nor, transitively, the
+  wrapped command ever sees it), and writes the signal number to it only
+  when `res.Signal != 0`, right before exiting. `sandbox.Run` reads the
+  pipe to EOF after `Wait()` returns (guaranteed non-blocking at that
+  point: `runChild`'s exit is what closes its copy of fd 3, and `Wait()`
+  already returned, so both copies are gone by construction) — a
+  non-empty read means signal death, decoded into `ExitCode: -1`; empty
+  means a normal exit, decoded via the existing exit-code passthrough.
+  Zero collision surface with any exit code the wrapped command might
+  produce, because it's not the same channel at all.
+
+**Chose:** The pipe. `Result.ExitCode`'s public contract ("-1 if
+terminated by a signal") is preserved exactly, with no API change to
+`sandbox.Result` — the fix is entirely internal to how `-1` gets decided.
+
+**Why:** The pipe is a small addition (one `os.Pipe()`, one `ExtraFiles`
+entry, one `close-on-exec` call, a handful of lines) that makes the
+report unambiguous by construction rather than "unambiguous in practice
+for exit codes we expect wrapped commands to use" — the latter is
+exactly the kind of assumption that doesn't hold against arbitrary,
+potentially adversarial input, which is this whole tool's threat model.
+
+**Verified, not assumed, including the specific collision the sentinel
+approach would have had:**
+- `cordon run sh -c 'kill -TERM $$'` → `Result{ExitCode: -1}` (was `143`
+  before this fix).
+- `cordon run sh -c 'exit 143'` — chosen because 143 is the *exact* value
+  a sentinel-exit-code design would have used to mean "died from
+  SIGTERM" — → `Result{ExitCode: 143}`, a normal exit, correctly *not*
+  misreported as a signal death. This is direct proof the pipe design
+  avoids the specific failure mode the rejected alternative would have
+  had, not just an argument that it should.
+- Full suite green, stable across 3 repeated runs.
+
+**New regression tests** (`internal/sandbox/sandbox_test.go`):
+`TestRun_WrappedCommandSignalDeathReportsNegativeOne` is the exact repro
+from this bug, now exercised end-to-end through the real public
+`sandbox.Run` API — full namespace setup, real ptrace tracer, real PID 1
+— not a lower-level unit test of some internal piece.
+`TestRun_NormalExitInSignalSentinelRangeIsNotMisreported` locks in the
+specific reason the sentinel approach was rejected. Neither existed
+before: sandbox-runner's original signal tests (2026-09-01) proved a
+wrapped command *receiving* signals correctly; nothing proved PID 1's own
+*reporting* of that death was correct — that gap is exactly how this
+survived through both the original rewrite and its own review commentary
+claiming no exit-code-contract change was needed.
+
+**Consequences:**
+- Easy: no public API change; every existing caller of `sandbox.Run`
+  keeps working unchanged, now against a contract that's actually true.
+- Slightly more machinery in `runChild`/`Run`: one extra fd for the
+  lifetime of the sandboxed run. Negligible overhead next to everything
+  else this feature already does.
+- `runChild`'s own raw exit code (`128+signal` on the signal path) is now
+  purely a human-debugging convenience (`ps`, `strace`) — `sandbox.Run`
+  no longer reads it for correctness, only the pipe.
+
+**If asked to defend this:** "PID 1 can't be killed by a same-namespace
+sender, full stop — that's kernel policy, not something to work around,
+and it now applies to our own tracer process the same way the 2026-09-01
+entry already found it applied to the old design. So instead of trying to
+make self-signaling work, `runChild` reports the death over a pipe file
+descriptor set aside for exactly that, and `sandbox.Run` decodes it after
+the process exits. We rejected encoding it in the exit code itself
+because the wrapped command is untrusted and could pick that same value
+on its own — proved that concretely by making a wrapped command exit
+with the exact number a sentinel would have used, and confirming it's
+still reported as a normal exit, not a signal death."
+
+---
+
+## [2026-09-05] arm64 build tag: fail the build, not the runtime
+
+**Context:** The same `/code-review ultra` run found that
+`internal/syscallcapture/capture_linux.go` carried only `//go:build
+linux`, but its ptrace register access (`Orig_rax`, `Rsi`, `Rax`, `Rdx`,
+`Rdi`) is the amd64-specific layout of `syscall.PtraceRegs`. `//go:build
+linux` matches linux/arm64 too, and `capture_other.go`'s `//go:build
+!linux` doesn't cover that gap (`!linux` is false when `GOOS=linux`
+regardless of architecture) — so `GOOS=linux GOARCH=arm64 go build`
+failed with a wall of `undefined field` compiler errors. Verified
+directly: reproduced the exact failure before touching anything.
+
+**Options considered:**
+- **Implement the real arm64 equivalent** — different `PtraceRegs`
+  layout (`Regs [31]uint64`, `Sp`, `Pc`, `Pstate`, no named x86
+  registers) and a different syscall-number/argument-register calling
+  convention. Real, standalone work; INTENT.md §3 doesn't currently
+  commit to arm64 at all, so building it speculatively here would be
+  scope past what anything asked for.
+- **Widen `capture_other.go`'s tag to also cover `linux && !amd64`**,
+  compiling the existing runtime stub (`errUnsupported`) for arm64. This
+  is what the review's own suggested fix proposed, and it's a real
+  improvement over today's cryptic compile failure. Rejected anyway: it
+  trades a build-time failure for a runtime one — the binary builds
+  cleanly and only reveals it captures nothing the first time someone
+  actually runs it. For a security tool, a binary that looks like it
+  works and silently doesn't is a worse failure mode than one that
+  refuses to build at all, especially across a CI-builds-on-amd64,
+  deploys-on-arm64 split where the runtime failure might not surface
+  until production.
+- **Fail the build itself, explicitly, on `linux && !amd64`** (chosen).
+
+**Chose:** `capture_linux.go`'s tag narrowed to `//go:build linux &&
+amd64`. A new file, `capture_unsupported.go`, tagged `//go:build linux &&
+!amd64`, exists solely to fail compilation with a deliberate, readable
+error: an `init()` that calls
+`cordonSyscallCaptureNotYetImplementedForThisLinuxArchitecture`, a
+function defined nowhere on purpose. Go has no `#error` directive; an
+undefined-reference to a descriptively-named identifier is the standard
+idiom for a deliberate, self-explanatory build-time failure.
+`capture_other.go`'s `!linux` tag is untouched — non-Linux platforms are
+unaffected, still get the existing runtime stub, unchanged.
+
+**Why:** The three tags (`linux && amd64`, `linux && !amd64`, `!linux`)
+are mutually exclusive and jointly exhaustive over all `(GOOS, GOARCH)` —
+exactly one file compiles for any target, with no gap and no overlap.
+Since `internal/sandbox` (and therefore `cmd/cordon`) imports
+`internal/syscallcapture` directly, this failure propagates to the whole
+binary on `linux/arm64` — the *whole* build fails, not just one internal
+package. That's deliberate, not a side effect to accept: a `cordon`
+binary that builds but cannot actually observe anything would be worse
+than one that never builds, and the whole point of failing loudly here is
+to make that impossible to ship by accident.
+
+**Verified, not assumed:**
+- `go build ./...` (linux/amd64, the actual dev target): clean, unchanged.
+- `GOOS=linux GOARCH=arm64 go build ./...`: fails at exactly
+  `capture_unsupported.go:31:2: undefined:
+  cordonSyscallCaptureNotYetImplementedForThisLinuxArchitecture` — a
+  single, clear, intentional error instead of seven scattered `undefined
+  field` errors pointing at the wrong root cause.
+- `GOOS=darwin GOARCH=amd64 go build ./internal/syscallcapture/...`:
+  still clean, confirming `capture_other.go`'s existing non-Linux stub
+  path is untouched.
+
+**Consequences:**
+- Easy: cross-compiling for an unsupported Linux architecture fails
+  immediately and points a reader straight at the reason, via the doc
+  comment on the failing file.
+- Hard/deferred: real arm64 support is still unbuilt and unscheduled —
+  this fix's whole job was turning a confusing accidental failure into an
+  honest, deliberate one, not delivering the feature.
+
+**If asked to defend this:** "The build tag said 'any Linux' when the
+code only actually works on Linux-amd64 — arm64 hit real compiler errors
+from register fields that don't exist there. Rather than widen the
+existing runtime-stub file to also cover arm64 — which would make the
+binary build fine and only fail the first time someone actually tries to
+use it — we added a dedicated file that fails the *build* on any
+non-amd64 Linux target, on purpose, with a self-explanatory error. For a
+tool whose entire job is observing what a process does, a binary that
+builds but silently observes nothing is a worse outcome than a build that
+refuses to happen at all."

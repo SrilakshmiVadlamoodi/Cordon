@@ -7,7 +7,9 @@ import "errors"
 // errUnsupported is returned by Run on every non-Linux platform. Cordon is
 // Linux-only by design (INTENT.md §3 Platform); this stub exists so the
 // module still builds and `go vet` still runs on a non-Linux workstation
-// (mirrors internal/sandbox/run_other.go).
+// (mirrors internal/sandbox/run_other.go). This tag deliberately does
+// NOT extend to linux/!amd64 — see capture_unsupported.go, which fails
+// the build there instead of compiling this runtime stub.
 var errUnsupported = errors.New("cordon: syscall capture requires Linux ptrace and seccomp")
 
 func Run(Config, func(Event)) (Result, error) { return Result{}, errUnsupported }
