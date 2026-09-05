@@ -152,7 +152,14 @@ Sandbox one `npm install`, capture file/network/process events, print a
 plain-text report.
 
 - [x] `sandbox-runner` — rootless namespace confinement
-- [ ] `syscall-capture` — `openat` / `connect` / `execve` with resolved args
+- [x] `syscall-capture` — `openat` / `connect` / `execve` with resolved
+      args, traced process scoped to the single directly-launched child
+      (see `features/syscall-capture/intent.md` Scope split) — unchecked
+      2026-09-04 for a sibling-thread event drop, fixed same day, see
+      that doc
+- [ ] `syscall-capture-tree` — widen tracing to the full process tree
+      (fork/clone/exec auto-attach); deferred out of `syscall-capture`,
+      not yet phase-scheduled — see `features/syscall-capture-tree/intent.md`
 - [ ] `behavior-report` — plain-text diagnosis
 - [ ] Correct on the 5-package MVP corpus (2 benign, 1 legitimate native
       build, 2 known-malicious)

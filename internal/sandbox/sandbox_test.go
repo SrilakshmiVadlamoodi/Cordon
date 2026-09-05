@@ -10,13 +10,18 @@ import (
 	"testing"
 
 	"github.com/SrilakshmiVadlamoodi/cordon/internal/sandbox"
+	"github.com/SrilakshmiVadlamoodi/cordon/internal/syscallcapture"
 )
 
 // TestMain routes the re-exec: when Run launches /proc/self/exe as the
-// in-namespace child, the test binary is what actually runs, so it must
-// give sandbox its chance to take over before any test executes.
+// in-namespace child (and that child, in turn, launches it a second time
+// as syscallcapture's ptrace tracee helper), the test binary is what
+// actually runs each time, so it must give each layer its chance to take
+// over before any test executes. See cmd/cordon/main.go for the same
+// two-hook pattern in the real binary.
 func TestMain(m *testing.M) {
 	sandbox.MaybeRunChild()
+	syscallcapture.MaybeRunTracee()
 	os.Exit(m.Run())
 }
 

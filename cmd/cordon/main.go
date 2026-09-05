@@ -8,12 +8,19 @@ import (
 	"os"
 
 	"github.com/SrilakshmiVadlamoodi/cordon/internal/sandbox"
+	"github.com/SrilakshmiVadlamoodi/cordon/internal/syscallcapture"
 )
 
 func main() {
-	// If this process was re-exec'd by sandbox.Run as the in-namespace
-	// child, MaybeRunChild does the sandbox setup and never returns.
+	// This binary can be re-exec'd as either of two in-process helpers,
+	// nested one inside the other; each hook is a no-op unless its own
+	// sentinel env var is set, and neither returns if it takes over.
+	// Outer: sandbox.Run's in-namespace child (mounts, pivot_root, then
+	// becomes PID 1 tracer/reaper — see runChild).
 	sandbox.MaybeRunChild()
+	// Inner: syscallcapture.Run's ptrace tracee helper (installs the
+	// seccomp filter, then execve's into the real wrapped command).
+	syscallcapture.MaybeRunTracee()
 	os.Exit(run(os.Args[1:]))
 }
 
