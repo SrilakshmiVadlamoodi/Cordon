@@ -1,0 +1,8 @@
+# Session state for a local tooling hook, not project source.
+.remember/
+
+# Go build artifacts
+/cordon
+*.exe
+*.test
+*.out
