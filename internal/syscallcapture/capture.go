@@ -26,15 +26,32 @@ type Result struct {
 	ExitCode int
 	// Signal is the signal that killed it, or 0 if it exited normally.
 	Signal syscall.Signal
-	// UnobservedDescendants is the count of distinct separate processes
-	// the traced program forked that were kept alive (so they don't
-	// ENOSYS) but never traced — the process-tree gap deferred to
-	// features/syscall-capture-tree. A forked process with its own
-	// thread pool counts once (grouped by Tgid). It is a *lower bound*:
-	// a task that exits before its /proc/<pid>/status can be read is not
-	// counted. behaviorreport surfaces this in the report so "what
-	// Cordon did not observe" is a real per-run number, not a generic
-	// line (INTENT.md §1: best-effort, and say so specifically).
+	// UnobservedDescendants is the count of distinct forked thread-groups
+	// (grouped by Tgid — a forked process with its own thread pool counts
+	// once) that were kept alive so they don't ENOSYS but never traced:
+	// the process-tree gap deferred to features/syscall-capture-tree.
+	//
+	// It is a rough figure, NOT a precise syscall-capture measurement.
+	// Two reasons, both of which a reader should know before quoting it:
+	//   - Lower bound. A task that exits before its /proc/<pid>/status
+	//     can be read returns Tgid 0 and is skipped.
+	//   - It counts every forked thread-group, including ones the wrapped
+	//     program's language runtime forks for its own internal
+	//     bookkeeping — not only ones the program's code launched. Go's
+	//     runtime, for example, does a one-time clone(CLONE_PIDFD)
+	//     support probe (a throwaway child) on the first os/exec call,
+	//     and that child lands in this count. Whether a runtime does
+	//     that, and how often, is version- and language-specific and is
+	//     not something syscallcapture predicts or controls. On the
+	//     current toolchain it is a stable +1 for a Go wrapped command
+	//     that shells out; that is an observation, not a contract.
+	//     Read this as "distinct processes we saw and did not trace",
+	//     not "subprocesses the install launched".
+	//
+	// behaviorreport surfaces it in the report ("N other processes were
+	// launched and NOT traced") so "what Cordon did not observe" is a
+	// real per-run number, not a generic line (INTENT.md §1: best-effort,
+	// and say so specifically). See DECISIONS.md 2026-09-05.
 	UnobservedDescendants int
 }
 
