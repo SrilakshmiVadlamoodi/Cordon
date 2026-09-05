@@ -40,6 +40,54 @@ func TestRun_PassesThroughExitCode(t *testing.T) {
 	}
 }
 
+// TestRun_WrappedCommandSignalDeathReportsNegativeOne is the regression
+// test for DECISIONS.md 2026-09-05 "PID 1 signal re-raise is silently
+// dropped by the kernel": the exact repro from that entry, exercised
+// through the real, public sandbox.Run API end-to-end (full namespace
+// setup, real ptrace tracer, real PID 1) rather than as a lower-level
+// unit test. Before that fix, this reported ExitCode 143 (the
+// os.Exit(128+signal) fallback), not -1 — the earlier sandbox-runner
+// tests only ever proved the wrapped command (PID 2) receives signals
+// correctly; none of them exercised PID 1's own death *reporting*,
+// which is exactly the gap that let this ship.
+func TestRun_WrappedCommandSignalDeathReportsNegativeOne(t *testing.T) {
+	requireUserNS(t)
+
+	res, err := sandbox.Run(sandbox.Spec{
+		Command:    []string{"/bin/sh", "-c", "kill -TERM $$"},
+		ProjectDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.ExitCode != -1 {
+		t.Fatalf("ExitCode = %d, want -1 (signal death)", res.ExitCode)
+	}
+}
+
+// TestRun_NormalExitInSignalSentinelRangeIsNotMisreported guards the
+// specific reason a sentinel exit code (e.g. 128+signal) was rejected in
+// favor of the pipe-based report: a wrapped command's own, unrelated
+// choice of exit code must never be misread as a signal death just
+// because it happens to land in that numeric range.
+func TestRun_NormalExitInSignalSentinelRangeIsNotMisreported(t *testing.T) {
+	requireUserNS(t)
+
+	res, err := sandbox.Run(sandbox.Spec{
+		// 143 == 128+SIGTERM, the exact value a sentinel-exit-code
+		// design would have used to mean "died from SIGTERM" — chosen
+		// deliberately to prove this is a real, ordinary exit, not that.
+		Command:    []string{"/bin/sh", "-c", "exit 143"},
+		ProjectDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if res.ExitCode != 143 {
+		t.Fatalf("ExitCode = %d, want 143 (a normal exit, not a misreported signal death)", res.ExitCode)
+	}
+}
+
 func TestRun_PassesThroughStdoutAndStderrUnchanged(t *testing.T) {
 	requireUserNS(t)
 
