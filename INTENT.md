@@ -160,10 +160,18 @@ plain-text report.
 - [ ] `syscall-capture-tree` — widen tracing to the full process tree
       (fork/clone/exec auto-attach); deferred out of `syscall-capture`,
       not yet phase-scheduled — see `features/syscall-capture-tree/intent.md`
-- [ ] `behavior-report` — plain-text diagnosis
-- [ ] Correct on the 5-package MVP corpus (2 benign, 1 legitimate native
-      build, 2 known-malicious)
-- [ ] Overhead on a real install measured and recorded
+- [x] `behavior-report` — plain-text diagnosis (to stderr; two crude
+      rules — credential-read / network-egress; see that feature's
+      intent.md for deviations)
+- [x] Correct on the MVP corpus — built as 6 **synthetic** fixtures
+      (`testdata/corpus/`: 2 benign, 1 native-build-style, 2
+      malicious-pattern, 1 bare-connect), not real registry packages;
+      `cmd/cordon/corpus_test.go` is the check. A real-package corpus is
+      still worthwhile later (Phase 2 expands it anyway).
+- [x] Overhead on a real install measured and recorded (DECISIONS.md
+      2026-09-04: +32.7% after the openat fast-path fix — still over
+      INTENT §3's "not noticeably longer" bar, accepted as a documented
+      gap for this phase)
 
 ### Phase 2 — Signal-to-noise
 
