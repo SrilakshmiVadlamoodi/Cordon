@@ -149,7 +149,8 @@ Two consequences that are product requirements, not polish:
 ### Phase 1 — MVP *(current)*
 
 Sandbox one `npm install`, capture file/network/process events, print a
-plain-text report.
+plain-text report (to **stderr** — the wrapped command owns stdout; see
+`features/behavior-report/intent.md` and DECISIONS.md 2026-09-05).
 
 - [x] `sandbox-runner` — rootless namespace confinement
 - [x] `syscall-capture` — `openat` / `connect` / `execve` with resolved
