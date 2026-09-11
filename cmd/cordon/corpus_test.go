@@ -132,11 +132,22 @@ type corpusCase struct {
 	wantContain []string
 	wantAbsent  []string
 
-	// wantOrder asserts each pair's first substring appears earlier in
-	// the report than its second — for features/finding-confidence,
-	// where the claim under test is relative order among findings that
-	// are all individually present, not any one finding's mere
-	// presence.
+	// wantOrder asserts RELATIVE ORDER, not presence — each pair's first
+	// substring's index in the report must be lower than its second's.
+	// This is a distinct claim from wantHit (which only proves a finding
+	// is present somewhere) and wantMiss (which only proves one is
+	// absent): a case can pass every wantHit in its table entry — both
+	// findings genuinely there — while still rendering them in the
+	// wrong order, and wantHit has no way to catch that. wantOrder
+	// exists specifically for features/finding-confidence's claim, which
+	// only makes sense as an ordering statement: among two-or-more HIGH
+	// findings, the definite-confidence one (or the exfil-correlation
+	// finding, unconditionally) must render first. A fixture proving
+	// this deliberately opens the LOWER-priority marker first
+	// (`definite-before-heuristic.go`), so a pass here rules out the
+	// specific failure mode a naive presence check would miss: passing
+	// by accident because insertion order happened to already match the
+	// required display order.
 	wantOrder [][2]string
 
 	noHigh        bool // assert no "[HIGH]" anywhere in the report
