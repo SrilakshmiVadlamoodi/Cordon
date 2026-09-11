@@ -35,4 +35,7 @@ is Phase 2 work.
 - Two rules only: credential-read (HIGH), network egress (MEDIUM, → HIGH
   only when paired with a credential-read in the same run). The `.npmrc`
   path marker is a known false-positive shape (matches a legit
-  token-free project-local `.npmrc` too), tracked for Phase 2.
+  token-free project-local `.npmrc` too) — addressable, not fixed, by
+  [[allowlist-mechanism]]: a developer can exempt their own `.npmrc`
+  path, but the rule itself still cannot tell a safe one from a stolen
+  one on its own.

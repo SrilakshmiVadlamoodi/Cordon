@@ -2004,3 +2004,105 @@ anyone designed or previously tested — worth saying plainly so it's not
 mistaken for an engineered anti-evasion feature. And it only helps
 against slow delay; a fast background action is exactly as invisible as
 any other untraced child process."
+
+---
+
+## [2026-09-11] allowlist-mechanism: exact-path only, read-before-launch, and the self-write bypass reproduced directly
+
+**Context:** Both recorded credential-read false positives (`.npmrc`
+without a token, DECISIONS.md 2026-09-05; a legitimate `.env`, made
+detectable at all by the 2026-09-11 marker fix) are content problems —
+`syscall-capture` traces `openat`, never `read`, so no path-based rule
+can ever tell a token-free `.npmrc` from a stolen one. Phase 2's
+roadmap names an allowlist mechanism for exactly this. Full design
+reasoning (granularity, location/authorship, the honesty requirement,
+the two named bypass risks) is in
+`features/allowlist-mechanism/intent.md` — this entry covers what was
+actually built and, specifically, verified rather than assumed.
+
+**What shipped:** `internal/behaviorreport/allowlist.go` — `Allowlist`
+(an opaque value type; matching is a private method so a caller cannot
+construct one that bypasses validation), `LoadAllowlist` (parses
+`.cordon-allowlist`: one path per line, `#` comments, blank lines
+ignored), `LoadAllowlistFile` (reads `<projectDir>/.cordon-allowlist`,
+a missing file is not an error — empty allowlist, the zero-friction
+default). `Generate` gained a third parameter, `allow Allowlist`: an
+allowlisted path is withheld from `Report.Findings` and recorded in the
+new `Report.Suppressed` (title + path, not just a count) instead;
+critically, the path stays in the internal `credentialPaths` slice the
+exfil-correlation check reads, so `Possible credential exfiltration`
+still fires if the same run also connects out — confirmed as the
+intended design, not an oversight, before writing any code.
+`WriteText` gained a `SUPPRESSED BY ALLOWLIST (N)` section (named
+entries, not a bare count — a suppression is a deliberate developer
+choice, unlike `UnobservedDescendants`, so the report should make it
+trivial to audit) and, when `Allowlist.Ignored > 0`, a line stating how
+many `.cordon-allowlist` lines were present but invalid and therefore
+had zero effect.
+
+**Fail-safe parsing, concretely:** `LoadAllowlist` accepts a line only
+if, after `filepath.Clean`, it is an absolute path AND `os.Stat`
+confirms a file exists there *at load time*. Anything else — relative,
+malformed, pointing at nothing — is dropped and counted in `Ignored`,
+never applied. Verified both directions with real files, not just the
+happy path: `TestLoadAllowlist_InvalidEntriesAreIgnoredNotApplied`
+(unit) plants a real file for the valid entry and a real *absence* for
+the invalid one, and asserts the valid entry suppresses while the
+invalid one's path still produces a normal `Credential file read`
+finding — the fail-safe direction is asserted, not just the accept
+path. The corpus fixture `testdata/corpus/allowlist-mechanism/
+malformed-entries-ignored.go` repeats this end-to-end through the real
+binary.
+
+**The self-write bypass — timing confirmed by reading the actual code
+path, then reproduced, not just argued:** the named risk in
+`features/allowlist-mechanism/intent.md` is a package under audit
+editing `.cordon-allowlist` mid-run to self-certify a path it's about
+to read. Traced the exact call sequence in
+`internal/sandbox/run_linux.go`'s `runChild` to confirm there is no
+window: `allow := behaviorreport.LoadAllowlistFile(cfg.ProjectDir)`
+(line 256) runs and *returns* — a synchronous, blocking file read —
+strictly before `syscallcapture.Run` is even called (line 267). Inside
+`Run` (`internal/syscallcapture/capture_linux.go`), the wrapped
+command's own image doesn't exist yet either: `Run` first
+`cmd.Start()`s a re-exec'd tracee helper under `PTRACE_TRACEME`, waits
+for its post-exec stop, installs seccomp options, and only then lets
+`MaybeRunTracee` `syscall.Exec` into the actual wrapped command. Every
+one of those steps happens after `LoadAllowlistFile` has already
+returned in `runChild`. There is structurally no point at which the
+wrapped command's own code — the only thing that could try this
+bypass — is running before the allowlist snapshot for this run is
+already fixed in memory.
+
+That ordering argument was not left as the only evidence. The corpus
+fixture `testdata/corpus/allowlist-mechanism/self-write-too-late.go`
+reproduces the actual attempt: no `.cordon-allowlist` exists when the
+fixture starts (only the secret file is planted); the fixture creates
+the allowlist file itself, naming its own about-to-be-read path, and
+only then reads that path.
+`TestCorpus_BehaviorReport/self-write-too-late` asserts the
+`Credential file read` finding for that path still appears and no
+`SUPPRESSED BY ALLOWLIST` section exists at all — the bypass attempt
+demonstrably fails on this run, not just "should fail per the code."
+
+**What this does not close:** editing `.cordon-allowlist` still works
+for a *future* run — nothing here makes the file tamper-proof, only
+makes tampering during the audited run itself inert. The mitigation for
+a future-run edit is procedural (check the file into version control so
+an unexpected change is a visible diff), stated in the feature's
+intent.md, not enforced in code.
+
+**If asked to defend this:** "The credential-read rule matches path, not
+content, so it can never distinguish a safe `.npmrc` from a stolen one
+on its own — the allowlist exists to let the one party who *can* know
+that, the developer, say so explicitly, per exact file, never a
+pattern. The sharper design question was whether a package being
+audited could write its own allowlist entry mid-run to clear itself.
+I traced the actual call sequence — the allowlist is read and returned
+before the tracee process that becomes the wrapped command is even
+started — and then didn't stop at that argument: built a fixture that
+actually attempts the self-write and reads the file in the same run,
+and the regression test confirms the finding still fires. Fail-safe
+parsing got the same treatment — a unit test that plants a real missing
+file, not just a well-formed one, to prove an invalid entry leaves the
+path flagged rather than silently exempting it."
