@@ -75,6 +75,15 @@ func TestGenerate_CredentialReadPlusConnect_Escalates(t *testing.T) {
 	}
 }
 
+func TestGenerate_DotEnvRead_IsHigh(t *testing.T) {
+	r := behaviorreport.Generate([]syscallcapture.Event{
+		ev("openat", "/home/u/proj/.env", ""),
+	}, 0)
+	if got := severities(r); len(got) != 1 || got[0] != "HIGH:Credential file read" {
+		t.Fatalf("findings = %v, want one HIGH credential-read for .env", got)
+	}
+}
+
 func TestGenerate_CredentialReadNoConnect_DoesNotEscalate(t *testing.T) {
 	r := behaviorreport.Generate([]syscallcapture.Event{
 		ev("openat", "/home/u/proj/.npmrc", ""),

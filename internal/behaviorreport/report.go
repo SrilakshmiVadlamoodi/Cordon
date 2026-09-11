@@ -77,7 +77,11 @@ func (c *Collector) OnEvent(e syscallcapture.Event) {
 // project-local `.npmrc` holding only registry config, no token, would
 // match too — a known false-positive shape this rule does not
 // distinguish, tracked for Phase 2's allowlist work (see
-// testdata/corpus/credential-read-no-network/README.md).
+// testdata/corpus/credential-read-no-network/README.md). `/.env` has the
+// same shape of imprecision: it also matches `/.envrc` (a direnv config
+// file, not a dotenv secrets file) — a known, accepted false-positive
+// class in the same family as `.npmrc`, not fixed here for the same
+// reason (see DECISIONS.md, ".env credential marker was missing").
 var credentialPathMarkers = []string{
 	"/.ssh/id_rsa",
 	"/.ssh/id_ed25519",
@@ -92,6 +96,7 @@ var credentialPathMarkers = []string{
 	"/.gnupg/",
 	"/.bash_history",
 	"/.zsh_history",
+	"/.env",
 }
 
 // Generate runs the rules over the events and the descendant count.
