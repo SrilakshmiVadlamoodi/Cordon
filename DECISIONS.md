@@ -1859,3 +1859,148 @@ runtime forks for its own reasons — both stated in the code, not hidden."
 ---
 
 **Note (2026-09-11):** Both Phase 1 merges (`syscall-capture`, `behavior-report`) were fast-forwards, confirmed via `git reflog` to have been done correctly on real feature branches (checkout → commits → fast-forward merge → branch deleted) — recorded here since a fast-forward merge is indistinguishable from a direct-to-main commit once the branch ref is gone, which left this ambiguous to a later reader until the reflog was checked. Phase 2 merges use `--no-ff` so branch history stays visible in `git log` without needing the reflog.
+
+---
+
+## [2026-09-11] `.env` credential marker was missing — fixed, not deferred
+
+**Context:** Building the Phase 2 corpus expansion's `credential-marker-gap`
+category (a fixture meant to prove a real, currently-live gap in
+`credentialPathMarkers`), checked which common real-world secret stores
+the existing 13 markers actually cover. `.env` — the single most common
+secrets file in the Node/Python ecosystems Cordon targets (dotenv-style
+`API_KEY=...` files, read by nearly every framework's boot sequence) —
+was not among them. Any package install that reads a project's `.env`
+file today produces no `Credential file read` finding at all.
+
+**Options considered:**
+- **Document as an accepted Phase 2 gap**, matching how other taxonomy
+  refinements in `features/behavior-report/intent.md` are deferred.
+  Rejected: unlike the `.npmrc` false-positive (a precision judgment call
+  about a path that legitimately might not hold a secret), this is a
+  false *negative* on one of the most common real secret files that
+  exists — a coverage bug, not a taxonomy trade-off, and one line to fix.
+- **Add `/.env` to `credentialPathMarkers` now.** Chosen.
+
+**Chose:** Added `/.env` to the marker list (`internal/behaviorreport/report.go`),
+plus `TestGenerate_DotEnvRead_IsHigh` (unit) and the `credential-marker-gap`
+corpus fixture (end-to-end, asserts the real binary now reports a HIGH for
+a planted `.env` file with a fake key). This is a separate commit from the
+corpus-expansion work that surfaced it, per instruction: a rule bug fix and
+a test-corpus feature are two different kinds of change even though one
+led directly to the other.
+
+**Why now rather than deferred:** The distinction that matters is *why* a
+path is missing detection. `.npmrc` is flagged, matched, and *known* to
+sometimes be a false alarm — that's a documented precision trade-off with
+a real judgment call behind it. `.env` wasn't a judgment call at all; it
+simply wasn't in the list, and there's no legitimate reason a package
+install should be reading a project's dotenv file. Nothing about
+INTENT.md §1's "detection is best-effort" language excuses shipping a
+known, trivially-fixable hole in coverage of the most common secret file
+format there is.
+
+**Consequences:**
+- Easy: `.env` reads by an install now surface a HIGH the same way `.ssh`
+  or `.aws` reads already do — no new code path, just a new entry in an
+  existing list.
+- Same accepted imprecision as `.npmrc`, inherited rather than introduced:
+  `/.env` as a substring also matches `/.envrc` (a direnv shell-config
+  file, not a dotenv secrets file) — a false positive in the same family,
+  not fixed here, tracked alongside `.npmrc`'s existing caveat for Phase
+  2's allowlist/precision work.
+- Does not change the rule's fundamental shape (substring match on a
+  resolved path) or its scope (still only fires on an `openat`, so the
+  same syscall-capture visibility limits — untraced forked children,
+  namespace-tree gap — apply to `.env` reads exactly as they do to every
+  other marker).
+
+**If asked to defend this:** "Building a corpus fixture meant to
+demonstrate a marker gap, I found the gap was `.env` itself — the most
+common real-world secrets file for the ecosystems this tool targets,
+and it wasn't in the list at all. That's not a precision trade-off like
+`.npmrc`'s, it's a plain coverage bug with a one-line fix, so I fixed it
+in its own commit rather than writing a fixture that proves a hole I
+could close in the same sitting. It inherits `.npmrc`'s same kind of
+false-positive risk against `.envrc`, which I left as-is and logged
+rather than trying to solve two problems in one change."
+
+---
+
+## [2026-09-11] PID-1 exit kills a detached descendant before a delayed action can complete — verified, not assumed; a side effect, not a designed defense
+
+**Context:** Planning the `delayed-process` corpus category (a package
+that backgrounds a child and exits immediately, hoping the child's
+sensitive action happens after the report is already generated), asked
+first whether this actually evades anything, rather than writing the
+fixture and its assertions on an unverified assumption either way.
+
+**Method:** built a standalone probe fixture — background
+`sleep 2 && write a marker file into the project directory` (the
+project dir being the one path guaranteed writable and host-visible),
+exit the primary process immediately — and ran it through the real
+`cordon` binary. Checked for the marker file both immediately after
+`cordon run` returned and again after waiting past the child's own
+2-second delay. A first pass (marker written to the sandbox's `/` root)
+was a confounded experiment — `/` is remounted read-only regardless of
+timing (DECISIONS.md 2026-09-01), so that test couldn't isolate the
+timing question at all. Redone against the project directory, which
+stays read-write for the run's duration.
+
+**Result:** the marker file never appears, in either check.
+
+**Root cause:** `runChild` is PID 1 of the sandbox's PID namespace
+(DECISIONS.md 2026-09-04, "runChild no longer execve's the wrapped
+command"). Per `pid_namespaces(7)`: when a PID namespace's init process
+terminates, the kernel immediately sends SIGKILL to every other process
+still alive in that namespace. `runChild` calls `os.Exit` as soon as
+`syscallcapture.Run` returns (which itself returns as soon as the
+primary tracee exits, without waiting for other descendants — see the
+"Scope split" note in `features/syscall-capture/intent.md`), so the
+detached child is killed mid-`sleep`, before its write ever executes.
+
+**Is this a designed defense? No — flagged explicitly so it isn't
+mistaken for one.** Nothing in `runChild` or `syscallcapture.Run` was
+written to wait for or kill descendants for isolation purposes; the
+PID-1 architecture exists for signal-fidelity reasons (2026-09-04
+entry), and this teardown behavior is a side effect of it, not a
+property anyone set out to build or verify as a defense until this
+investigation. It is fully reliable — kernel-guaranteed, not a race —
+but its reliability is coincidental to why the architecture exists.
+
+**What it actually bounds, precisely:** only *slow* delay. A descendant
+whose action completes before (or as) the primary exits pays no timing
+penalty and remains exactly as invisible to the report as any other
+untraced forked process (same gap as the `credential-read-gap` corpus
+category) — "background and act fast" gets neither more nor less
+detection than acting inline in a child; only "background and wait it
+out" gets cut off, and it's cut off by being killed, not by being
+observed.
+
+**Consequences:**
+- A real, testable, checked-in guarantee now exists
+  (`testdata/corpus/delayed-process/`,
+  `TestCorpus_DelayedProcess_DoesNotOutliveTheRun` in
+  `cmd/cordon/corpus_test.go`) that a delayed/backgrounded action cannot
+  outlive the wrapped command's own run — useful to cite, but only with
+  the "side effect, not designed" caveat attached, so nobody later
+  claims Cordon engineered anti-persistence and tested it as such.
+  Anyone building `features/syscall-capture-tree` should re-check this
+  behavior isn't accidentally lost if that feature ever changes how or
+  when `runChild` exits relative to the process tree.
+- No change to INTENT.md §1's best-effort framing: this is a property of
+  the isolation layer (hard boundary — namespace lifetime), not the
+  detection layer, and it doesn't change what happens to *not* get
+  reported.
+
+**If asked to defend this:** "I checked whether backgrounding a child to
+act after the report is generated actually buys an attacker anything,
+rather than assuming either way. It doesn't, for slow delay: PID 1 exiting
+triggers an immediate, kernel-mandated SIGKILL of the whole PID
+namespace, verified by a probe whose marker file never lands even
+seconds past its own sleep. But that's a side effect of the PID-1
+architecture we built for faithful signal delivery, not a defense
+anyone designed or previously tested — worth saying plainly so it's not
+mistaken for an engineered anti-evasion feature. And it only helps
+against slow delay; a fast background action is exactly as invisible as
+any other untraced child process."
