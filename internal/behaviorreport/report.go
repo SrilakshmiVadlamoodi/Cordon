@@ -18,6 +18,14 @@ import (
 	"github.com/SrilakshmiVadlamoodi/cordon/internal/syscallcapture"
 )
 
+// maxRenderedFindings caps both the Findings and Suppressed render loops
+// in WriteText. The report crosses a pipe with a fixed buffer and is
+// read only after the writer exits (sandbox.Run's cmd.Wait then
+// io.ReadAll), so an unbounded render of either list — hundreds of
+// distinct connect targets, or a developer allowlisting many distinct
+// paths under one broad marker like /.gnupg/ — could deadlock it.
+const maxRenderedFindings = 100
+
 // Severity is coarse on purpose for the MVP.
 type Severity int
 
@@ -55,6 +63,29 @@ type Report struct {
 	// syscallcapture.Result — separate processes the install forked that
 	// were not traced (features/syscall-capture-tree).
 	UnobservedDescendants int
+
+	// Suppressed lists Rule 1 findings that matched a credential-path
+	// marker but were withheld because the path is in the developer's
+	// own .cordon-allowlist. Named explicitly (title + path), not just
+	// counted: a suppression is a deliberate developer decision, unlike
+	// UnobservedDescendants, so the report should make it trivial to
+	// audit that decision against what actually happened this run
+	// (features/allowlist-mechanism/intent.md).
+	Suppressed []SuppressedFinding
+
+	// AllowlistIgnored is the number of lines in .cordon-allowlist that
+	// were present but invalid (relative path, or no file exists there)
+	// and were therefore dropped rather than applied — see
+	// Allowlist.Ignored. Surfaced so a developer whose allowlist entry
+	// silently did nothing (a typo, a moved file) can tell why.
+	AllowlistIgnored int
+}
+
+// SuppressedFinding records one Rule 1 finding that would have been
+// reported HIGH but was withheld because Path is in the allowlist.
+type SuppressedFinding struct {
+	Title string
+	Path  string
 }
 
 // Collector is the cheap onEvent sink: it only appends. All
@@ -100,8 +131,14 @@ var credentialPathMarkers = []string{
 }
 
 // Generate runs the rules over the events and the descendant count.
-func Generate(events []syscallcapture.Event, unobservedDescendants int) Report {
-	r := Report{UnobservedDescendants: unobservedDescendants}
+// allow suppresses Rule 1's standalone finding for any path it covers
+// (features/allowlist-mechanism/intent.md) but has no effect on Rule 2's
+// exfil-correlation check below, which considers every matched
+// credential path regardless of allowlist status — allowlisting says
+// "reading this file alone isn't alarming," not "ignore this file even
+// in combination with a network connection this run."
+func Generate(events []syscallcapture.Event, unobservedDescendants int, allow Allowlist) Report {
+	r := Report{UnobservedDescendants: unobservedDescendants, AllowlistIgnored: allow.Ignored}
 
 	var credentialPaths []string
 	var connectAddrs []string
@@ -130,8 +167,14 @@ func Generate(events []syscallcapture.Event, unobservedDescendants int) Report {
 	// Rule 1 — credential-read: HIGH, one finding per distinct secret
 	// path opened. Fires regardless of whether the open succeeded or
 	// whether any network activity followed: the attempt alone is the
-	// signal.
+	// signal. An allowlisted path is withheld from Findings and recorded
+	// in Suppressed instead — it is NOT removed from credentialPaths
+	// itself, so the exfil-correlation check below still sees it.
 	for _, p := range credentialPaths {
+		if allow.allows(p) {
+			r.Suppressed = append(r.Suppressed, SuppressedFinding{Title: "Credential file read", Path: p})
+			continue
+		}
 		r.Findings = append(r.Findings, Finding{
 			Severity: High,
 			Title:    "Credential file read",
@@ -156,6 +199,10 @@ func Generate(events []syscallcapture.Event, unobservedDescendants int) Report {
 					"Shown as IP:port — the hostname the install asked for is not captured.", a),
 		})
 	}
+	// credentialPaths here is the FULL matched set, allowlisted entries
+	// included — see Generate's doc comment for why this correlation is
+	// not subject to the allowlist the way the standalone Rule 1 finding
+	// above is.
 	if len(credentialPaths) > 0 && len(connectAddrs) > 0 {
 		r.Findings = append(r.Findings, Finding{
 			Severity: High,
@@ -201,10 +248,9 @@ func (r Report) WriteText(w io.Writer) {
 		// unbounded render (a run that connects to hundreds of distinct
 		// hosts) could deadlock. Highest-severity findings sort first, so
 		// the cap only ever drops lower-severity tail entries.
-		const maxRendered = 100
 		shown := r.Findings
-		if len(shown) > maxRendered {
-			shown = shown[:maxRendered]
+		if len(shown) > maxRenderedFindings {
+			shown = shown[:maxRenderedFindings]
 		}
 		for _, f := range shown {
 			fmt.Fprintf(w, "  [%s] %s\n", f.Severity, f.Title)
@@ -213,9 +259,33 @@ func (r Report) WriteText(w io.Writer) {
 			}
 			fmt.Fprintln(w)
 		}
-		if len(r.Findings) > maxRendered {
-			fmt.Fprintf(w, "  ... and %d more finding(s) not shown.\n\n", len(r.Findings)-maxRendered)
+		if len(r.Findings) > maxRenderedFindings {
+			fmt.Fprintf(w, "  ... and %d more finding(s) not shown.\n\n", len(r.Findings)-maxRenderedFindings)
 		}
+	}
+
+	if len(r.Suppressed) > 0 {
+		fmt.Fprintf(w, "SUPPRESSED BY ALLOWLIST (%d)\n\n", len(r.Suppressed))
+		// Same cap and rationale as Findings above: this crosses the same
+		// fixed-size pipe, read only after the writer exits, so an
+		// unbounded render (a developer allowlisting many distinct paths
+		// under one broad marker, e.g. /.gnupg/) could deadlock it exactly
+		// as an uncapped Findings list could.
+		shown := r.Suppressed
+		if len(shown) > maxRenderedFindings {
+			shown = shown[:maxRenderedFindings]
+		}
+		for _, s := range shown {
+			fmt.Fprintf(w, "  [%s] %s\n", s.Title, s.Path)
+		}
+		if len(r.Suppressed) > maxRenderedFindings {
+			fmt.Fprintf(w, "  ... and %d more suppressed entry(ies) not shown.\n", len(r.Suppressed)-maxRenderedFindings)
+		}
+		fmt.Fprintln(w, "  A finding above was withheld because its exact path is listed in this")
+		fmt.Fprintf(w, "  project's %s. This does not affect any 'Possible credential\n", AllowlistFileName)
+		fmt.Fprintln(w, "  exfiltration' finding, which still considers this path if it was also")
+		fmt.Fprintln(w, "  involved in a network connection this run.")
+		fmt.Fprintln(w)
 	}
 
 	fmt.Fprintln(w, "OBSERVED")
@@ -239,4 +309,9 @@ func (r Report) WriteText(w io.Writer) {
 	}
 	fmt.Fprintln(w, "  - Detection is best-effort by design (INTENT.md §1): a determined package")
 	fmt.Fprintln(w, "    can act through syscalls Cordon does not watch, or through a child process.")
+	if r.AllowlistIgnored > 0 {
+		fmt.Fprintf(w, "  - %d entry(ies) in %s were ignored (not an absolute path to\n", r.AllowlistIgnored, AllowlistFileName)
+		fmt.Fprintln(w, "    a file that exists) and treated as NOT allowlisted -- any matching path")
+		fmt.Fprintln(w, "    stays flagged as usual.")
+	}
 }

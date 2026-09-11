@@ -183,7 +183,12 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
       whether more categories/variants are still wanted.)*
 - [ ] Behavior taxonomy with written rationale per rule
 - [ ] Severity tiers; highest-value finding surfaces first
-- [ ] Allowlist mechanism for known-good patterns
+- [x] Allowlist mechanism for known-good patterns
+      *(deviation, deliberate: exact developer-authored paths only, not
+      patterns — a path pattern loose enough to cover a legitimate file
+      is loose enough to cover a malicious one at a similarly-shaped
+      path; see `features/allowlist-mechanism/intent.md` "Why not
+      globs" and DECISIONS.md 2026-09-11)*
 - [ ] False-positive rate measured and published in README
 
 ### Phase 3 — Distribution
