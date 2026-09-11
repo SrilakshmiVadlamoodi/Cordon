@@ -39,19 +39,23 @@ type Allowlist struct {
 }
 
 func (a Allowlist) allows(path string) bool {
-	return a.paths != nil && a.paths[path]
+	// A nil map read (not write) is safe in Go and returns the zero
+	// value, so this needs no separate nil check.
+	return a.paths[path]
 }
 
 // LoadAllowlist parses .cordon-allowlist content from r: one path per
 // line, blank lines and lines starting with '#' ignored. A line is
 // accepted only if, after filepath.Clean, it is an absolute path AND a
-// file actually exists there right now (checked via os.Stat) — matching
-// the same resolved-path string Rule 1 already compares against
-// (Event.Path via matchCredentialMarker). Any other line (relative,
-// malformed, or naming a file that doesn't exist) is silently dropped
-// from the effective allowlist and counted in Ignored: this is
-// deliberately fail-safe, not fail-open — an invalid entry never
-// suppresses a finding, it just does nothing.
+// regular file actually exists there right now (checked via os.Stat,
+// rejecting directories explicitly — os.Stat alone does not distinguish
+// a file from a directory, and a directory entry could never match an
+// openat path anyway) — matching the same resolved-path string Rule 1
+// already compares against (Event.Path via matchCredentialMarker). Any
+// other line (relative, malformed, a directory, or naming a path that
+// doesn't exist) is silently dropped from the effective allowlist and
+// counted in Ignored: this is deliberately fail-safe, not fail-open — an
+// invalid entry never suppresses a finding, it just does nothing.
 func LoadAllowlist(r io.Reader) Allowlist {
 	paths := map[string]bool{}
 	ignored := 0
@@ -67,7 +71,8 @@ func LoadAllowlist(r io.Reader) Allowlist {
 			ignored++
 			continue
 		}
-		if _, err := os.Stat(clean); err != nil {
+		info, err := os.Stat(clean)
+		if err != nil || info.IsDir() {
 			ignored++
 			continue
 		}

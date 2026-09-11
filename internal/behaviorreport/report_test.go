@@ -1,6 +1,7 @@
 package behaviorreport_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -204,6 +205,68 @@ func TestLoadAllowlist_InvalidEntriesAreIgnoredNotApplied(t *testing.T) {
 	if len(notSuppressed.Findings) != 1 || len(notSuppressed.Suppressed) != 0 {
 		t.Fatalf("the nonexistent-file entry must NOT suppress -- path should stay flagged: findings=%v suppressed=%v",
 			notSuppressed.Findings, notSuppressed.Suppressed)
+	}
+}
+
+func TestLoadAllowlist_DirectoryEntryIsIgnoredNotApplied(t *testing.T) {
+	dir := t.TempDir()
+	// A real directory, not a file -- os.Stat alone does not distinguish
+	// the two, and a directory entry could never match an openat path
+	// anyway, so it must be rejected explicitly rather than silently
+	// accepted into the allow-set.
+	gnupgDir := filepath.Join(dir, ".gnupg")
+	if err := os.MkdirAll(gnupgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	allow := behaviorreport.LoadAllowlist(strings.NewReader(gnupgDir + "\n"))
+	if allow.Ignored != 1 {
+		t.Fatalf("Ignored = %d, want 1 (the directory entry)", allow.Ignored)
+	}
+
+	// A file inside that directory still matches the /.gnupg/ marker but
+	// must stay flagged -- the directory entry never suppresses it.
+	keyFile := filepath.Join(gnupgDir, "secring.gpg")
+	r := behaviorreport.Generate([]syscallcapture.Event{
+		ev("openat", keyFile, ""),
+	}, 0, allow)
+	if len(r.Findings) != 1 || len(r.Suppressed) != 0 {
+		t.Fatalf("a directory allowlist entry must not suppress a file inside it: findings=%v suppressed=%v",
+			r.Findings, r.Suppressed)
+	}
+}
+
+func TestReport_WriteText_SuppressedListIsCapped(t *testing.T) {
+	dir := t.TempDir()
+	const total = 105
+	var lines []string
+	var events []syscallcapture.Event
+	for i := 0; i < total; i++ {
+		p := filepath.Join(dir, fmt.Sprintf(".ssh/id_rsa_%d", i))
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("key\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, p)
+		events = append(events, ev("openat", p, ""))
+	}
+	allow := behaviorreport.LoadAllowlist(strings.NewReader(strings.Join(lines, "\n")))
+
+	r := behaviorreport.Generate(events, 0, allow)
+	if len(r.Suppressed) != total {
+		t.Fatalf("Suppressed = %d entries, want %d (Generate itself is not capped, only rendering)", len(r.Suppressed), total)
+	}
+
+	var b strings.Builder
+	r.WriteText(&b)
+	out := b.String()
+	if !strings.Contains(out, fmt.Sprintf("SUPPRESSED BY ALLOWLIST (%d)", total)) {
+		t.Errorf("missing the full suppressed count in the section header:\n%s", out)
+	}
+	if !strings.Contains(out, "... and 5 more suppressed entry(ies) not shown.") {
+		t.Errorf("missing the capped-render tail line for the remaining 5 entries:\n%s", out)
 	}
 }
 
