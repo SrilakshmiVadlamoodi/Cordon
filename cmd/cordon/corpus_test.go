@@ -132,6 +132,13 @@ type corpusCase struct {
 	wantContain []string
 	wantAbsent  []string
 
+	// wantOrder asserts each pair's first substring appears earlier in
+	// the report than its second — for features/finding-confidence,
+	// where the claim under test is relative order among findings that
+	// are all individually present, not any one finding's mere
+	// presence.
+	wantOrder [][2]string
+
 	noHigh        bool // assert no "[HIGH]" anywhere in the report
 	noMedium      bool // assert no "[MEDIUM]" anywhere in the report
 	wantEmpty     bool // assert the literal "No findings." line
@@ -348,6 +355,30 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 			},
 			wantAbsent: []string{"SUPPRESSED BY ALLOWLIST (2)"},
 		},
+
+		// --- finding-confidence ---
+		{
+			name:  "definite-before-heuristic: id_rsa outranks .npmrc despite opening second",
+			group: "finding-confidence",
+			file:  "definite-before-heuristic",
+			plant: func(dir string) { plantNpmrc(dir); plantSSHKey(dir) },
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".npmrc"},
+			},
+			wantOrder: [][2]string{{"id_rsa", ".npmrc"}},
+		},
+		{
+			name:  "exfil-ranks-first-even-with-heuristic-marker: correlation outranks a heuristic credential-read",
+			group: "finding-confidence",
+			file:  "exfil-ranks-first-even-with-heuristic-marker",
+			plant: plantNpmrc,
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.60:443"},
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".npmrc"},
+			},
+			wantOrder: [][2]string{{"Possible credential exfiltration", "[HIGH] Credential file read"}},
+		},
 	}
 
 	for _, c := range cases {
@@ -375,6 +406,18 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 			}
 			for _, s := range c.wantAbsent {
 				mustNotContain(t, r, s)
+			}
+
+			for _, pair := range c.wantOrder {
+				earlier, later := pair[0], pair[1]
+				ei, li := strings.Index(r, earlier), strings.Index(r, later)
+				if ei < 0 {
+					t.Errorf("wantOrder: %q not found in report:\n%s", earlier, r)
+				} else if li < 0 {
+					t.Errorf("wantOrder: %q not found in report:\n%s", later, r)
+				} else if ei >= li {
+					t.Errorf("wantOrder: %q (at %d) should appear before %q (at %d):\n%s", earlier, ei, later, li, r)
+				}
 			}
 
 			if c.noHigh {

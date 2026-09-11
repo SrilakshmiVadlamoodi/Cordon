@@ -61,11 +61,14 @@ func TestGenerate_CredentialReadPlusConnect_Escalates(t *testing.T) {
 		ev("connect", "", "203.0.113.21:443"),
 	}, 0, behaviorreport.Allowlist{})
 	got := severities(r)
-	// Highest severity first: the two HIGHs (credential read, exfil
-	// correlation) before the MEDIUM connection.
+	// Highest severity first; within HIGH, the exfil correlation ranks
+	// ahead of the standalone credential-read regardless of that read's
+	// own marker confidence (features/finding-confidence/intent.md) —
+	// it's the strongest combined signal Cordon can produce. Both HIGHs
+	// before the MEDIUM connection.
 	want := []string{
-		"HIGH:Credential file read",
 		"HIGH:Possible credential exfiltration",
+		"HIGH:Credential file read",
 		"MEDIUM:Network connection",
 	}
 	if len(got) != len(want) {
@@ -94,6 +97,28 @@ func TestGenerate_CredentialReadNoConnect_DoesNotEscalate(t *testing.T) {
 	got := severities(r)
 	if len(got) != 1 || got[0] != "HIGH:Credential file read" {
 		t.Fatalf("findings = %v, want one HIGH credential-read, no exfil finding", got)
+	}
+}
+
+func TestGenerate_DefiniteConfidenceSortsBeforeHeuristic(t *testing.T) {
+	// .npmrc (heuristic) opened BEFORE id_rsa (definite) -- if ordering
+	// were still just insertion order, .npmrc would render first. It
+	// must not: definiteConfidence findings sort ahead of
+	// heuristicConfidence ones within the same HIGH severity
+	// (features/finding-confidence/intent.md).
+	r := behaviorreport.Generate([]syscallcapture.Event{
+		ev("openat", "/home/u/proj/.npmrc", ""),
+		ev("openat", "/home/u/proj/.ssh/id_rsa", ""),
+	}, 0, behaviorreport.Allowlist{})
+
+	if len(r.Findings) != 2 {
+		t.Fatalf("findings = %v, want 2", severities(r))
+	}
+	if got := r.Findings[0].Detail; !strings.Contains(got, "id_rsa") {
+		t.Fatalf("first finding should be the definite-confidence id_rsa read, got detail:\n%s", got)
+	}
+	if got := r.Findings[1].Detail; !strings.Contains(got, ".npmrc") {
+		t.Fatalf("second finding should be the heuristic-confidence .npmrc read, got detail:\n%s", got)
 	}
 }
 

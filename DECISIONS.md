@@ -2172,3 +2172,82 @@ where a file was expected, more suppressed entries than the pipe buffer
 tolerates — not disputes with the core design. Fixed all four, added a
 regression test for each rather than trusting the fix by inspection, and
 re-ran the full suite before calling it done."
+
+---
+
+## [2026-09-11] finding-confidence: a secondary sort key, not a third severity tier — and .netrc's classification, a judgment call not in the original proposal
+
+**Context:** INTENT.md §4 Phase 2's "severity tiers; highest-value
+finding surfaces first" was investigated before writing any code
+(features/finding-confidence/intent.md has the full reasoning). The
+two-tier HIGH/MEDIUM design already works; the concrete, already-
+reproducible gap is that `Generate`'s sort was stable on `Severity`
+alone, so `escalation-volume`'s `multi-secret-multi-host` fixture — three
+simultaneous HIGH `Credential file read` findings — had no guarantee
+about which rendered first, even though the codebase's own comments
+already treat some markers (`id_rsa`, `.aws/credentials`) as
+definitionally secret and others (`.npmrc`, `.env`, shell history) as
+known path-only heuristics.
+
+**Chose:** a `markerConfidence` (`definiteConfidence` /
+`heuristicConfidence`) per `credentialMarker`, used only as a secondary
+`sort.SliceStable` key beneath `Severity` — `Finding.confidenceRank()`
+ranks the `Possible credential exfiltration` finding first
+unconditionally (checked by title, before confidence is ever consulted),
+then `definiteConfidence` findings, then `heuristicConfidence` ones.
+`Finding.confidence` is unexported: only `Generate` sets it, and its
+zero value is `heuristicConfidence` deliberately — a `Finding` built
+without setting confidence defaults to the more skeptical reading, not
+the more alarming one. No third `Severity` value; `WriteText`'s rendered
+labels are unchanged.
+
+**`.netrc`'s classification — a real judgment call, made and logged
+rather than silently decided:** the approved `finding-confidence/intent.md`
+named `definiteConfidence` examples as "private keys, cloud credential
+files, git credentials, docker config" and `heuristicConfidence` examples
+as "`.npmrc`, `.env`, shell history, the `.gnupg/` prefix" — `.netrc` was
+in neither list. Classified it `definiteConfidence` here, reasoning by
+analogy to `.git-credentials`: its file format (machine/login/password
+stanzas) has no legitimate "config only, no secret" reading the way
+`.npmrc`'s registry-URL-only case does — unlike `.npmrc`, there's no
+common legitimate use of a `.netrc` that holds zero credential material.
+Documented in report.go's doc comment and here rather than silently
+picked, since it's exactly the kind of unstated inference CLAUDE.md's
+"flag ambiguous inference explicitly" rule is about — this one didn't
+rise to stopping and asking (a single marker's confidence tier, not a
+structural design choice), but it's on the record for review.
+
+**Also logged, not resolved:** `/.docker/config.json` stays
+`definiteConfidence` per the approved doc's explicit list, despite a real
+tension noticed while writing the doc comment — many modern Docker
+configs hold only a `credsStore` pointer to an external credential
+helper, no embedded secret in the file itself, which is structurally
+closer to `.npmrc`'s shape than to a private key's. Not reclassified
+without discussion; flagged in the code comment for a future revisit.
+
+**Consequences:**
+- `TestGenerate_DefiniteConfidenceSortsBeforeHeuristic` (unit) and two
+  corpus fixtures — `definite-before-heuristic.go` (opens the heuristic
+  marker first, definite second, proving order is confidence-driven, not
+  insertion-order-driven) and `exfil-ranks-first-even-with-heuristic-marker.go`
+  (proves the correlation finding ranks first even when paired with a
+  heuristic-confidence read, not only the definite-confidence case
+  `allowlist-mechanism` happened to already exercise) — all new,
+  end-to-end through the real binary via a new `wantOrder [][2]string`
+  field added to `corpusCase` (asserts one substring's index precedes
+  another's).
+- One existing test's expectation flipped, correctly:
+  `TestGenerate_CredentialReadPlusConnect_Escalates` previously asserted
+  `Credential file read` before `Possible credential exfiltration` — an
+  artifact of insertion order, never a deliberate guarantee. Updated to
+  match the now-guaranteed order (exfil correlation first), not silently
+  left passing on the old, accidental expectation.
+
+**If asked to defend this:** "The roadmap said severity tiers; the
+evidence said a stable two-tier design plus escalation already works,
+and the real bug was that multiple simultaneous HIGHs had no ordering
+guarantee at all — proven by a fixture that already existed
+(`multi-secret-multi-host`) and just never asserted order. Fixed it as a
+secondary sort key, not a new tier, and flagged the one real judgment
+call in the marker list (`.netrc`) instead of quietly deciding it, since
+the original proposal didn't name it explicitly either way."
