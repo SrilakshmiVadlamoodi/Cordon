@@ -177,6 +177,10 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
 ### Phase 2 — Signal-to-noise
 
 - [ ] Corpus expanded to ~50 packages across ecosystems
+      *(9 archetype groups / ~16 fixtures shipped so far — synthetic, not
+      registry packages, same reasoning as Phase 1's corpus; see
+      `features/corpus-expansion/intent.md`. Short of ~50; open question
+      whether more categories/variants are still wanted.)*
 - [ ] Behavior taxonomy with written rationale per rule
 - [ ] Severity tiers; highest-value finding surfaces first
 - [ ] Allowlist mechanism for known-good patterns
