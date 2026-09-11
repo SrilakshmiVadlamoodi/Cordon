@@ -243,6 +243,19 @@ func runChild(cfg childConfig) {
 		os.Exit(127)
 	}
 
+	// Load the developer's allowlist (features/allowlist-mechanism/
+	// intent.md) now, before syscallcapture.Run does anything at all.
+	// This read completes, synchronously, strictly before the tracee
+	// process even exists — Run's first action is to fork+exec a fresh
+	// helper under PTRACE_TRACEME, and the wrapped command (cfg.Command)
+	// does not get its own execve until several steps after that. So a
+	// write the wrapped command later makes to .cordon-allowlist happens
+	// causally after this read has already returned; it cannot affect
+	// the Allowlist value used below, only a future run. See DECISIONS.md
+	// for the regression test that reproduces this attempt directly
+	// rather than relying on this ordering argument alone.
+	allow := behaviorreport.LoadAllowlistFile(cfg.ProjectDir)
+
 	// Collect captured events cheaply (append-only; classification is
 	// deferred), then generate the report here in this process and write
 	// it back to sandbox.Run over fd 4 — never to the wrapped command's
@@ -262,7 +275,7 @@ func runChild(cfg childConfig) {
 		os.Exit(125)
 	}
 
-	behaviorreport.Generate(collector.Events, res.UnobservedDescendants).WriteText(reportPipe)
+	behaviorreport.Generate(collector.Events, res.UnobservedDescendants, allow).WriteText(reportPipe)
 	reportPipe.Close()
 
 	if res.Signal != 0 {
