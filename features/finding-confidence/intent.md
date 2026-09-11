@@ -30,30 +30,45 @@ HIGH `Credential file read` findings (`.ssh/id_rsa`, `.aws/credentials`,
 already-demonstrated gap, not a hypothetical one.
 
 **Done:**
-- [ ] Each `credentialPathMarkers` entry is tagged with a confidence
-      level: `definite` (the file's mere existence is inherently secret
-      material — private keys, cloud credential files, git credentials,
-      docker config) or `heuristic` (a known path-only marker that can
-      legitimately hold no secret — `.npmrc`, `.env`, shell history,
-      the `.gnupg/` prefix)
-- [ ] Within HIGH severity, `Generate` sorts `definite`-confidence
-      `Credential file read` findings before `heuristic`-confidence
-      ones. This is a secondary sort key beneath the existing `Severity`
-      primary key — MEDIUM still sorts last, exactly as today
-- [ ] The `Possible credential exfiltration` finding remains the single
+- [x] Each `credentialMarker` entry (formerly a bare string in
+      `credentialPathMarkers`) is tagged with a `markerConfidence`:
+      `definiteConfidence` (the file's mere existence is inherently
+      secret material — private keys, cloud credential files, git
+      credentials, docker config; `.netrc` classified definite too, on
+      the same "no legitimate config-only reading" basis as
+      `.git-credentials`, though not named explicitly in this doc's own
+      earlier draft — see the doc comment in report.go and DECISIONS.md
+      for that judgment call) or `heuristicConfidence` (`.npmrc`, `.env`,
+      shell history, the `.gnupg/` prefix)
+      *(`internal/behaviorreport/report.go`'s `credentialMarker`/
+      `markerConfidence`/`credentialMarkers`)*
+- [x] Within HIGH severity, `Generate` sorts `definiteConfidence`
+      `Credential file read` findings before `heuristicConfidence` ones,
+      as a secondary sort key beneath the existing `Severity` primary
+      key — MEDIUM still sorts last, exactly as today
+      *(`Finding.confidenceRank`, `TestGenerate_
+      DefiniteConfidenceSortsBeforeHeuristic`, corpus fixture
+      `finding-confidence/definite-before-heuristic.go`)*
+- [x] The `Possible credential exfiltration` finding remains the single
       highest-priority HIGH regardless of which confidence tier the
-      underlying credential read belongs to — it is the strongest
-      combined signal Cordon can produce, independent of any one
-      marker's own confidence
-- [ ] A corpus fixture with two-or-more HIGH findings at different
+      underlying credential read belongs to
+      *(`confidenceRank` checks the finding's own title first,
+      unconditionally, before ever consulting confidence; proven
+      end-to-end with a HEURISTIC-confidence marker specifically —
+      `finding-confidence/exfil-ranks-first-even-with-heuristic-marker.go`
+      — not just the definite-confidence case `allowlist-mechanism`
+      happened to already cover)*
+- [x] A corpus fixture with two-or-more HIGH findings at different
       confidence levels in one run asserts the `definite` one renders
-      first — closing the exact gap `multi-secret-multi-host` left open,
-      not just adding a parallel case
-- [ ] No new `Severity` enum value, and `WriteText`'s rendered label
+      first — closing the exact gap `multi-secret-multi-host` left open
+      *(`definite-before-heuristic.go` opens the heuristic marker FIRST
+      and the definite one SECOND, so the assertion proves confidence
+      drives order, not event/insertion order)*
+- [x] No new `Severity` enum value, and `WriteText`'s rendered label
       stays exactly `[HIGH]` / `[MEDIUM]` — confidence is an internal
-      ordering signal only, never a new user-facing tier. Three visible
-      severities would be the tier-proliferation the roadmap phrase
-      could be misread as asking for; this explicitly isn't that.
+      ordering signal only, never a new user-facing tier
+      *(`Finding.confidence` is unexported; `Severity` is unchanged,
+      still exactly two values)*
 
 **Constraints (slice-specific):**
 - Confidence is a different axis from allowlist suppression. An
