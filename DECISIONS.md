@@ -1855,3 +1855,7 @@ to classify it, so counting the distinct un-traced ones costs almost
 nothing, and it's a far more useful thing to tell a developer than 'we
 might miss stuff'. It's a lower bound, and it includes a process the Go
 runtime forks for its own reasons — both stated in the code, not hidden."
+
+---
+
+**Note (2026-09-11):** Both Phase 1 merges (`syscall-capture`, `behavior-report`) were fast-forwards, confirmed via `git reflog` to have been done correctly on real feature branches (checkout → commits → fast-forward merge → branch deleted) — recorded here since a fast-forward merge is indistinguishable from a direct-to-main commit once the branch ref is gone, which left this ambiguous to a later reader until the reflog was checked. Phase 2 merges use `--no-ff` so branch history stays visible in `git log` without needing the reflog.
