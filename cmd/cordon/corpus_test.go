@@ -132,6 +132,24 @@ type corpusCase struct {
 	wantContain []string
 	wantAbsent  []string
 
+	// wantOrder asserts RELATIVE ORDER, not presence — each pair's first
+	// substring's index in the report must be lower than its second's.
+	// This is a distinct claim from wantHit (which only proves a finding
+	// is present somewhere) and wantMiss (which only proves one is
+	// absent): a case can pass every wantHit in its table entry — both
+	// findings genuinely there — while still rendering them in the
+	// wrong order, and wantHit has no way to catch that. wantOrder
+	// exists specifically for features/finding-confidence's claim, which
+	// only makes sense as an ordering statement: among two-or-more HIGH
+	// findings, the definite-confidence one (or the exfil-correlation
+	// finding, unconditionally) must render first. A fixture proving
+	// this deliberately opens the LOWER-priority marker first
+	// (`definite-before-heuristic.go`), so a pass here rules out the
+	// specific failure mode a naive presence check would miss: passing
+	// by accident because insertion order happened to already match the
+	// required display order.
+	wantOrder [][2]string
+
 	noHigh        bool // assert no "[HIGH]" anywhere in the report
 	noMedium      bool // assert no "[MEDIUM]" anywhere in the report
 	wantEmpty     bool // assert the literal "No findings." line
@@ -348,6 +366,30 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 			},
 			wantAbsent: []string{"SUPPRESSED BY ALLOWLIST (2)"},
 		},
+
+		// --- finding-confidence ---
+		{
+			name:  "definite-before-heuristic: id_rsa outranks .npmrc despite opening second",
+			group: "finding-confidence",
+			file:  "definite-before-heuristic",
+			plant: func(dir string) { plantNpmrc(dir); plantSSHKey(dir) },
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".npmrc"},
+			},
+			wantOrder: [][2]string{{"id_rsa", ".npmrc"}},
+		},
+		{
+			name:  "exfil-ranks-first-even-with-heuristic-marker: correlation outranks a heuristic credential-read",
+			group: "finding-confidence",
+			file:  "exfil-ranks-first-even-with-heuristic-marker",
+			plant: plantNpmrc,
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.60:443"},
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".npmrc"},
+			},
+			wantOrder: [][2]string{{"Possible credential exfiltration", "[HIGH] Credential file read"}},
+		},
 	}
 
 	for _, c := range cases {
@@ -375,6 +417,18 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 			}
 			for _, s := range c.wantAbsent {
 				mustNotContain(t, r, s)
+			}
+
+			for _, pair := range c.wantOrder {
+				earlier, later := pair[0], pair[1]
+				ei, li := strings.Index(r, earlier), strings.Index(r, later)
+				if ei < 0 {
+					t.Errorf("wantOrder: %q not found in report:\n%s", earlier, r)
+				} else if li < 0 {
+					t.Errorf("wantOrder: %q not found in report:\n%s", later, r)
+				} else if ei >= li {
+					t.Errorf("wantOrder: %q (at %d) should appear before %q (at %d):\n%s", earlier, ei, later, li, r)
+				}
 			}
 
 			if c.noHigh {

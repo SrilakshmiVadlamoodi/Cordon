@@ -47,6 +47,13 @@ type Finding struct {
 	Title    string
 	// Detail is already-wrapped plain text, indented by the renderer.
 	Detail string
+
+	// confidence is an internal secondary sort key, never rendered —
+	// see markerConfidence and the sort in Generate. Unexported
+	// deliberately: only Generate should ever set it, so a caller
+	// outside this package cannot construct a Finding that jumps the
+	// queue.
+	confidence markerConfidence
 }
 
 // Report is the whole diagnosis: findings plus an honest account of what
@@ -101,33 +108,86 @@ func (c *Collector) OnEvent(e syscallcapture.Event) {
 	c.Events = append(c.Events, e)
 }
 
-// credentialPathMarkers are substrings that mark a path as a well-known
-// secret store. Matched as plain substrings against the resolved path —
+// markerConfidence classifies how strongly a credentialMarker's own
+// existence implies secret material, independent of Severity — see
+// features/finding-confidence/intent.md. It is used only as a secondary
+// sort key among findings that are already HIGH; it never changes
+// whether something is HIGH, MEDIUM, or a finding at all.
+type markerConfidence int
+
+const (
+	// heuristicConfidence markers are path-only signals that can
+	// legitimately hold no secret at all — Cordon cannot see file
+	// contents (it traces openat, never read), so these are exactly the
+	// known false-positive shapes already on record (.npmrc without a
+	// token, DECISIONS.md 2026-09-05; a non-secret .env, DECISIONS.md
+	// 2026-09-11). heuristicConfidence is the zero value deliberately:
+	// a Finding built without setting confidence (nothing outside this
+	// file does, but future code should default to the more skeptical
+	// reading, not the more alarming one) reads as heuristic, not
+	// definite.
+	heuristicConfidence markerConfidence = iota
+	// definiteConfidence markers have no legitimate "config only, no
+	// secret" reading — the file's sole documented purpose is storing
+	// credential material (a private key; a cloud provider's literal
+	// access-key file; git's or netrc's plaintext credential store).
+	definiteConfidence
+)
+
+// credentialMarker pairs a path substring with how strongly its mere
+// existence implies secret material.
+type credentialMarker struct {
+	pattern    string
+	confidence markerConfidence
+}
+
+// credentialMarkers are substrings that mark a path as a well-known
+// secret store, matched as plain substrings against the resolved path —
 // crude but adequate for the MVP, and each has no legitimate reason to
-// be opened by a package install. `.npmrc` is the loosest of these: a
-// project-local `.npmrc` holding only registry config, no token, would
-// match too — a known false-positive shape this rule does not
-// distinguish, tracked for Phase 2's allowlist work (see
-// testdata/corpus/credential-read-no-network/README.md). `/.env` has the
-// same shape of imprecision: it also matches `/.envrc` (a direnv config
-// file, not a dotenv secrets file) — a known, accepted false-positive
-// class in the same family as `.npmrc`, not fixed here for the same
-// reason (see DECISIONS.md, ".env credential marker was missing").
-var credentialPathMarkers = []string{
-	"/.ssh/id_rsa",
-	"/.ssh/id_ed25519",
-	"/.ssh/id_ecdsa",
-	"/.ssh/id_dsa",
-	"/.aws/credentials",
-	"/.config/gcloud/credentials.db",
-	"/.npmrc",
-	"/.netrc",
-	"/.git-credentials",
-	"/.docker/config.json",
-	"/.gnupg/",
-	"/.bash_history",
-	"/.zsh_history",
-	"/.env",
+// be opened by a package install. All fire the same HIGH severity;
+// confidence only orders multiple simultaneous HIGHs, it never changes
+// whether one fires (features/finding-confidence/intent.md).
+//
+// `.npmrc` is heuristicConfidence: a project-local `.npmrc` holding only
+// registry config, no token, matches too — a known false-positive shape
+// this rule does not distinguish (tracked for Phase 2's allowlist work,
+// shipped as [[allowlist-mechanism]]; see
+// testdata/corpus/credential-read-no-network/README.md history).
+// `/.env` is the same shape of imprecision for the same reason
+// (DECISIONS.md, ".env credential marker was missing") — and also
+// matches `/.envrc` (a direnv config file, not a dotenv secrets file),
+// an accepted false-positive class in the same family. Shell history
+// files are heuristic for a different reason: they can hold an
+// accidentally-typed secret, but their designed purpose is a command
+// log, not a credential store.
+//
+// `/.netrc` is classified definiteConfidence here even though it wasn't
+// named explicitly in features/finding-confidence/intent.md's examples:
+// like `/.git-credentials`, its file format (machine/login/password
+// stanzas) has no legitimate "config only" reading the way `.npmrc`'s
+// registry-URL-only case does — its sole documented purpose is storing
+// plaintext credentials. `/.docker/config.json` is kept definiteConfidence
+// per that doc's explicit list, with a caveat worth flagging for a future
+// revisit: many modern Docker configs hold only a `credsStore` pointer to
+// an external credential helper, with no embedded secret in the file
+// itself — closer to `.npmrc`'s shape than to a private key's. Not
+// reclassified here without discussion, since the approved design named
+// it definite explicitly.
+var credentialMarkers = []credentialMarker{
+	{"/.ssh/id_rsa", definiteConfidence},
+	{"/.ssh/id_ed25519", definiteConfidence},
+	{"/.ssh/id_ecdsa", definiteConfidence},
+	{"/.ssh/id_dsa", definiteConfidence},
+	{"/.aws/credentials", definiteConfidence},
+	{"/.config/gcloud/credentials.db", definiteConfidence},
+	{"/.npmrc", heuristicConfidence},
+	{"/.netrc", definiteConfidence},
+	{"/.git-credentials", definiteConfidence},
+	{"/.docker/config.json", definiteConfidence},
+	{"/.gnupg/", heuristicConfidence},
+	{"/.bash_history", heuristicConfidence},
+	{"/.zsh_history", heuristicConfidence},
+	{"/.env", heuristicConfidence},
 }
 
 // Generate runs the rules over the events and the descendant count.
@@ -142,6 +202,12 @@ func Generate(events []syscallcapture.Event, unobservedDescendants int, allow Al
 
 	var credentialPaths []string
 	var connectAddrs []string
+	// credentialConfidence carries each matched path's confidence
+	// alongside credentialPaths, keyed by path — a secondary sort key
+	// for Rule 1's Findings (features/finding-confidence/intent.md), not
+	// used by the exfil-correlation check below, which treats every
+	// matched path identically regardless of confidence.
+	credentialConfidence := map[string]markerConfidence{}
 	seenCredPath := map[string]bool{}
 	seenAddr := map[string]bool{}
 
@@ -149,9 +215,10 @@ func Generate(events []syscallcapture.Event, unobservedDescendants int, allow Al
 		switch e.Syscall {
 		case "openat":
 			r.OpenCount++
-			if m := matchCredentialMarker(e.Path); m != "" && !seenCredPath[e.Path] {
+			if conf, matched := matchCredentialMarker(e.Path); matched && !seenCredPath[e.Path] {
 				seenCredPath[e.Path] = true
 				credentialPaths = append(credentialPaths, e.Path)
+				credentialConfidence[e.Path] = conf
 			}
 		case "connect":
 			r.ConnectCount++
@@ -181,6 +248,7 @@ func Generate(events []syscallcapture.Event, unobservedDescendants int, allow Al
 			Detail: fmt.Sprintf(
 				"The install opened a file matching a known secret path:\n  %s\n"+
 					"A package install has no legitimate reason to read this.", p),
+			confidence: credentialConfidence[p],
 		})
 	}
 
@@ -216,21 +284,46 @@ func Generate(events []syscallcapture.Event, unobservedDescendants int, allow Al
 		})
 	}
 
-	// Highest severity first; stable within a severity so output is
-	// deterministic for a given event order.
+	// Highest severity first, then by confidence rank within a severity
+	// (features/finding-confidence/intent.md) — stable beyond that, so
+	// output is deterministic for a given event order whenever severity
+	// and rank tie.
 	sort.SliceStable(r.Findings, func(i, j int) bool {
-		return r.Findings[i].Severity > r.Findings[j].Severity
+		fi, fj := r.Findings[i], r.Findings[j]
+		if fi.Severity != fj.Severity {
+			return fi.Severity > fj.Severity
+		}
+		return fi.confidenceRank() < fj.confidenceRank()
 	})
 	return r
 }
 
-func matchCredentialMarker(path string) string {
-	for _, m := range credentialPathMarkers {
-		if strings.Contains(path, m) {
-			return m
+// confidenceRank orders findings within the same Severity: the
+// exfil-correlation finding is always the single strongest signal
+// Cordon can produce, independent of which marker's confidence
+// triggered the credential-read half of it, so it ranks first
+// regardless of confidence. Among ordinary findings, definiteConfidence
+// ranks ahead of heuristicConfidence. This has no effect across
+// severities — Generate's sort already checks Severity first — so a
+// MEDIUM "Network connection" finding's zero-value confidence never
+// competes with a HIGH's.
+func (f Finding) confidenceRank() int {
+	if f.Title == "Possible credential exfiltration" {
+		return 0
+	}
+	if f.confidence == definiteConfidence {
+		return 1
+	}
+	return 2
+}
+
+func matchCredentialMarker(path string) (conf markerConfidence, matched bool) {
+	for _, m := range credentialMarkers {
+		if strings.Contains(path, m.pattern) {
+			return m.confidence, true
 		}
 	}
-	return ""
+	return heuristicConfidence, false
 }
 
 // WriteText renders the report as plain text to w (features/behavior-
