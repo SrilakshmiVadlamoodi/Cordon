@@ -1924,3 +1924,83 @@ in its own commit rather than writing a fixture that proves a hole I
 could close in the same sitting. It inherits `.npmrc`'s same kind of
 false-positive risk against `.envrc`, which I left as-is and logged
 rather than trying to solve two problems in one change."
+
+---
+
+## [2026-09-11] PID-1 exit kills a detached descendant before a delayed action can complete — verified, not assumed; a side effect, not a designed defense
+
+**Context:** Planning the `delayed-process` corpus category (a package
+that backgrounds a child and exits immediately, hoping the child's
+sensitive action happens after the report is already generated), asked
+first whether this actually evades anything, rather than writing the
+fixture and its assertions on an unverified assumption either way.
+
+**Method:** built a standalone probe fixture — background
+`sleep 2 && write a marker file into the project directory` (the
+project dir being the one path guaranteed writable and host-visible),
+exit the primary process immediately — and ran it through the real
+`cordon` binary. Checked for the marker file both immediately after
+`cordon run` returned and again after waiting past the child's own
+2-second delay. A first pass (marker written to the sandbox's `/` root)
+was a confounded experiment — `/` is remounted read-only regardless of
+timing (DECISIONS.md 2026-09-01), so that test couldn't isolate the
+timing question at all. Redone against the project directory, which
+stays read-write for the run's duration.
+
+**Result:** the marker file never appears, in either check.
+
+**Root cause:** `runChild` is PID 1 of the sandbox's PID namespace
+(DECISIONS.md 2026-09-04, "runChild no longer execve's the wrapped
+command"). Per `pid_namespaces(7)`: when a PID namespace's init process
+terminates, the kernel immediately sends SIGKILL to every other process
+still alive in that namespace. `runChild` calls `os.Exit` as soon as
+`syscallcapture.Run` returns (which itself returns as soon as the
+primary tracee exits, without waiting for other descendants — see the
+"Scope split" note in `features/syscall-capture/intent.md`), so the
+detached child is killed mid-`sleep`, before its write ever executes.
+
+**Is this a designed defense? No — flagged explicitly so it isn't
+mistaken for one.** Nothing in `runChild` or `syscallcapture.Run` was
+written to wait for or kill descendants for isolation purposes; the
+PID-1 architecture exists for signal-fidelity reasons (2026-09-04
+entry), and this teardown behavior is a side effect of it, not a
+property anyone set out to build or verify as a defense until this
+investigation. It is fully reliable — kernel-guaranteed, not a race —
+but its reliability is coincidental to why the architecture exists.
+
+**What it actually bounds, precisely:** only *slow* delay. A descendant
+whose action completes before (or as) the primary exits pays no timing
+penalty and remains exactly as invisible to the report as any other
+untraced forked process (same gap as the `credential-read-gap` corpus
+category) — "background and act fast" gets neither more nor less
+detection than acting inline in a child; only "background and wait it
+out" gets cut off, and it's cut off by being killed, not by being
+observed.
+
+**Consequences:**
+- A real, testable, checked-in guarantee now exists
+  (`testdata/corpus/delayed-process/`,
+  `TestCorpus_DelayedProcess_DoesNotOutliveTheRun` in
+  `cmd/cordon/corpus_test.go`) that a delayed/backgrounded action cannot
+  outlive the wrapped command's own run — useful to cite, but only with
+  the "side effect, not designed" caveat attached, so nobody later
+  claims Cordon engineered anti-persistence and tested it as such.
+  Anyone building `features/syscall-capture-tree` should re-check this
+  behavior isn't accidentally lost if that feature ever changes how or
+  when `runChild` exits relative to the process tree.
+- No change to INTENT.md §1's best-effort framing: this is a property of
+  the isolation layer (hard boundary — namespace lifetime), not the
+  detection layer, and it doesn't change what happens to *not* get
+  reported.
+
+**If asked to defend this:** "I checked whether backgrounding a child to
+act after the report is generated actually buys an attacker anything,
+rather than assuming either way. It doesn't, for slow delay: PID 1 exiting
+triggers an immediate, kernel-mandated SIGKILL of the whole PID
+namespace, verified by a probe whose marker file never lands even
+seconds past its own sleep. But that's a side effect of the PID-1
+architecture we built for faithful signal delivery, not a defense
+anyone designed or previously tested — worth saying plainly so it's not
+mistaken for an engineered anti-evasion feature. And it only helps
+against slow delay; a fast background action is exactly as invisible as
+any other untraced child process."
