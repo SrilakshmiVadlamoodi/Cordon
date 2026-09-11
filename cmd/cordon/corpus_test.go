@@ -81,6 +81,25 @@ func plantKnownHosts(projectDir string) {
 		[]byte("github.com ssh-ed25519 AAAA...\n"), 0o644)
 }
 
+// plantSSHKeyPreAllowlisted plants the SSH key AND authors
+// .cordon-allowlist to allow it, both before the fixture process starts
+// — the intended, legitimate use of the mechanism.
+func plantSSHKeyPreAllowlisted(projectDir string) {
+	plantSSHKey(projectDir)
+	entry := filepath.Join(projectDir, ".ssh", "id_rsa")
+	_ = os.WriteFile(filepath.Join(projectDir, ".cordon-allowlist"), []byte(entry+"\n"), 0o644)
+}
+
+// plantMalformedAllowlist plants two credential files, but authors
+// .cordon-allowlist with a RELATIVE (invalid) entry for one and a valid
+// absolute entry for the other — exercising fail-safe parsing.
+func plantMalformedAllowlist(projectDir string) {
+	plantSSHKey(projectDir)
+	plantAWSCreds(projectDir)
+	lines := ".ssh/id_rsa\n" + filepath.Join(projectDir, ".aws", "credentials") + "\n"
+	_ = os.WriteFile(filepath.Join(projectDir, ".cordon-allowlist"), []byte(lines), 0o644)
+}
+
 // ruleAssertion names a finding that MUST appear in the report.
 type ruleAssertion struct {
 	titleSubstr  string
@@ -104,6 +123,14 @@ type corpusCase struct {
 
 	wantHit  []ruleAssertion
 	wantMiss []expectedMiss
+
+	// wantContain/wantAbsent are plain substring checks with no special
+	// semantics (unlike wantMiss, which asserts a documented detection
+	// gap and requires a reason) — used for report structure that isn't
+	// itself a rule finding, e.g. the SUPPRESSED BY ALLOWLIST section or
+	// the allowlist-ignored-entries count.
+	wantContain []string
+	wantAbsent  []string
 
 	noHigh        bool // assert no "[HIGH]" anywhere in the report
 	noMedium      bool // assert no "[MEDIUM]" anywhere in the report
@@ -270,6 +297,57 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 			},
 			firstIsHigh: true,
 		},
+
+		// --- allowlist-mechanism ---
+		{
+			name:  "pre-authored-suppresses: standalone finding suppressed, named in report",
+			group: "allowlist-mechanism",
+			file:  "pre-authored-suppresses",
+			plant: plantSSHKeyPreAllowlisted,
+			wantContain: []string{
+				"SUPPRESSED BY ALLOWLIST (1)",
+				"[Credential file read]",
+			},
+			noHigh:   true,
+			noMedium: true,
+		},
+		{
+			name:  "still-correlates-with-network: allowlisting does not suppress exfil correlation",
+			group: "allowlist-mechanism",
+			file:  "still-correlates-with-network",
+			plant: plantSSHKeyPreAllowlisted,
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.50:443"},
+				{titleSubstr: "[MEDIUM] Network connection"},
+			},
+			wantContain: []string{"SUPPRESSED BY ALLOWLIST (1)"},
+			wantAbsent:  []string{"[HIGH] Credential file read"},
+			firstIsHigh: true,
+		},
+		{
+			name:  "self-write-too-late: mid-run allowlist edit has no effect on this run (3b regression)",
+			group: "allowlist-mechanism",
+			file:  "self-write-too-late",
+			plant: plantSSHKey, // no allowlist planted ahead of time -- the fixture writes its own
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+			},
+			wantAbsent: []string{"SUPPRESSED BY ALLOWLIST"},
+		},
+		{
+			name:  "malformed-entries-ignored: invalid entry stays flagged, valid entry suppresses",
+			group: "allowlist-mechanism",
+			file:  "malformed-entries-ignored",
+			plant: plantMalformedAllowlist,
+			wantHit: []ruleAssertion{
+				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+			},
+			wantContain: []string{
+				"SUPPRESSED BY ALLOWLIST (1)",
+				"1 entry(ies) in .cordon-allowlist were ignored",
+			},
+			wantAbsent: []string{"SUPPRESSED BY ALLOWLIST (2)"},
+		},
 	}
 
 	for _, c := range cases {
@@ -290,6 +368,13 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 				}
 				mustNotContain(t, r, miss.titleSubstr)
 				t.Logf("confirmed expected miss %q: %s", miss.titleSubstr, miss.reason)
+			}
+
+			for _, s := range c.wantContain {
+				mustContain(t, r, s)
+			}
+			for _, s := range c.wantAbsent {
+				mustNotContain(t, r, s)
 			}
 
 			if c.noHigh {

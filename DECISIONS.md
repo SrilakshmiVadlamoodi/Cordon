@@ -2004,3 +2004,171 @@ anyone designed or previously tested — worth saying plainly so it's not
 mistaken for an engineered anti-evasion feature. And it only helps
 against slow delay; a fast background action is exactly as invisible as
 any other untraced child process."
+
+---
+
+## [2026-09-11] allowlist-mechanism: exact-path only, read-before-launch, and the self-write bypass reproduced directly
+
+**Context:** Both recorded credential-read false positives (`.npmrc`
+without a token, DECISIONS.md 2026-09-05; a legitimate `.env`, made
+detectable at all by the 2026-09-11 marker fix) are content problems —
+`syscall-capture` traces `openat`, never `read`, so no path-based rule
+can ever tell a token-free `.npmrc` from a stolen one. Phase 2's
+roadmap names an allowlist mechanism for exactly this. Full design
+reasoning (granularity, location/authorship, the honesty requirement,
+the two named bypass risks) is in
+`features/allowlist-mechanism/intent.md` — this entry covers what was
+actually built and, specifically, verified rather than assumed.
+
+**What shipped:** `internal/behaviorreport/allowlist.go` — `Allowlist`
+(an opaque value type; matching is a private method so a caller cannot
+construct one that bypasses validation), `LoadAllowlist` (parses
+`.cordon-allowlist`: one path per line, `#` comments, blank lines
+ignored), `LoadAllowlistFile` (reads `<projectDir>/.cordon-allowlist`,
+a missing file is not an error — empty allowlist, the zero-friction
+default). `Generate` gained a third parameter, `allow Allowlist`: an
+allowlisted path is withheld from `Report.Findings` and recorded in the
+new `Report.Suppressed` (title + path, not just a count) instead;
+critically, the path stays in the internal `credentialPaths` slice the
+exfil-correlation check reads, so `Possible credential exfiltration`
+still fires if the same run also connects out — confirmed as the
+intended design, not an oversight, before writing any code.
+`WriteText` gained a `SUPPRESSED BY ALLOWLIST (N)` section (named
+entries, not a bare count — a suppression is a deliberate developer
+choice, unlike `UnobservedDescendants`, so the report should make it
+trivial to audit) and, when `Allowlist.Ignored > 0`, a line stating how
+many `.cordon-allowlist` lines were present but invalid and therefore
+had zero effect.
+
+**Fail-safe parsing, concretely:** `LoadAllowlist` accepts a line only
+if, after `filepath.Clean`, it is an absolute path AND `os.Stat`
+confirms a file exists there *at load time*. Anything else — relative,
+malformed, pointing at nothing — is dropped and counted in `Ignored`,
+never applied. Verified both directions with real files, not just the
+happy path: `TestLoadAllowlist_InvalidEntriesAreIgnoredNotApplied`
+(unit) plants a real file for the valid entry and a real *absence* for
+the invalid one, and asserts the valid entry suppresses while the
+invalid one's path still produces a normal `Credential file read`
+finding — the fail-safe direction is asserted, not just the accept
+path. The corpus fixture `testdata/corpus/allowlist-mechanism/
+malformed-entries-ignored.go` repeats this end-to-end through the real
+binary.
+
+**The self-write bypass — timing confirmed by reading the actual code
+path, then reproduced, not just argued:** the named risk in
+`features/allowlist-mechanism/intent.md` is a package under audit
+editing `.cordon-allowlist` mid-run to self-certify a path it's about
+to read. Traced the exact call sequence in
+`internal/sandbox/run_linux.go`'s `runChild` to confirm there is no
+window: `allow := behaviorreport.LoadAllowlistFile(cfg.ProjectDir)`
+(line 256) runs and *returns* — a synchronous, blocking file read —
+strictly before `syscallcapture.Run` is even called (line 267). Inside
+`Run` (`internal/syscallcapture/capture_linux.go`), the wrapped
+command's own image doesn't exist yet either: `Run` first
+`cmd.Start()`s a re-exec'd tracee helper under `PTRACE_TRACEME`, waits
+for its post-exec stop, installs seccomp options, and only then lets
+`MaybeRunTracee` `syscall.Exec` into the actual wrapped command. Every
+one of those steps happens after `LoadAllowlistFile` has already
+returned in `runChild`. There is structurally no point at which the
+wrapped command's own code — the only thing that could try this
+bypass — is running before the allowlist snapshot for this run is
+already fixed in memory.
+
+That ordering argument was not left as the only evidence. The corpus
+fixture `testdata/corpus/allowlist-mechanism/self-write-too-late.go`
+reproduces the actual attempt: no `.cordon-allowlist` exists when the
+fixture starts (only the secret file is planted); the fixture creates
+the allowlist file itself, naming its own about-to-be-read path, and
+only then reads that path.
+`TestCorpus_BehaviorReport/self-write-too-late` asserts the
+`Credential file read` finding for that path still appears and no
+`SUPPRESSED BY ALLOWLIST` section exists at all — the bypass attempt
+demonstrably fails on this run, not just "should fail per the code."
+
+**What this does not close:** editing `.cordon-allowlist` still works
+for a *future* run — nothing here makes the file tamper-proof, only
+makes tampering during the audited run itself inert. The mitigation for
+a future-run edit is procedural (check the file into version control so
+an unexpected change is a visible diff), stated in the feature's
+intent.md, not enforced in code.
+
+**If asked to defend this:** "The credential-read rule matches path, not
+content, so it can never distinguish a safe `.npmrc` from a stolen one
+on its own — the allowlist exists to let the one party who *can* know
+that, the developer, say so explicitly, per exact file, never a
+pattern. The sharper design question was whether a package being
+audited could write its own allowlist entry mid-run to clear itself.
+I traced the actual call sequence — the allowlist is read and returned
+before the tracee process that becomes the wrapped command is even
+started — and then didn't stop at that argument: built a fixture that
+actually attempts the self-write and reads the file in the same run,
+and the regression test confirms the finding still fires. Fail-safe
+parsing got the same treatment — a unit test that plants a real missing
+file, not just a well-formed one, to prove an invalid entry leaves the
+path flagged rather than silently exempting it."
+
+---
+
+## [2026-09-11] /code-review ultra findings on allowlist-mechanism: directory entries, the pipe-deadlock cap, and two nits
+
+**Context:** `/code-review ultra` against `allowlist-mechanism` before
+merge. Four findings, all "nit" severity, none disputing the core
+design (self-write timing, Rule 1/Rule 2 interaction) — a useful signal
+that the parts already stress-tested by direct reproduction held up,
+and the review caught the parts that weren't.
+
+**1. `LoadAllowlist` accepted directory entries as valid (real bug).**
+`os.Stat` doesn't distinguish a file from a directory; a line naming a
+real directory (e.g. `/proj/.gnupg`) passed both the `IsAbs` and `Stat`
+checks and was inserted into the allow-set, despite the doc comment's
+explicit "a file actually exists there" and intent.md's "no directory
+prefixes." It could never actually suppress anything (the map lookup
+needs an exact match against a file path an `openat` produced), so the
+practical damage was narrow — but it also silently failed to increment
+`Ignored`, defeating the one thing `AllowlistIgnored` exists to
+guarantee: a developer whose entry does nothing can tell why. Fixed by
+checking `info.IsDir()` alongside the existing `os.Stat` error check.
+`TestLoadAllowlist_DirectoryEntryIsIgnoredNotApplied` plants a real
+directory (not a mock) and confirms both the `Ignored` count and that a
+file inside it stays flagged.
+
+**2. `SUPPRESSED BY ALLOWLIST` rendered unbounded, undermining the
+`Findings` cap's own stated invariant (real bug, not yet exploitable at
+observed scale but a real inconsistency).** `WriteText`'s `Findings`
+loop caps at 100 specifically because the report crosses a fixed-size
+pipe and is read only after the writer exits (`sandbox.Run`'s
+`cmd.Wait` then `io.ReadAll`) — an unbounded render could deadlock it.
+The `Suppressed` loop added by this feature had no such cap, so a
+developer allowlisting many distinct paths under one broad marker
+(`/.gnupg/` matches an entire keyring directory's contents) could in
+principle reproduce the exact deadlock the `Findings` cap exists to
+prevent. Fixed by hoisting the cap to a package-level
+`maxRenderedFindings` constant shared by both loops, with the same
+"...and N more not shown" tail line. `TestReport_WriteText_
+SuppressedListIsCapped` builds 105 real allowlisted paths and confirms
+`Generate` itself is uncapped (all 105 in `Report.Suppressed`) while
+`WriteText`'s render stops at 100 with a tail line for the remaining 5
+— the cap is a rendering concern, not a classification one.
+
+**3 & 4. Two nits, both fixed:** the literal `".cordon-allowlist"` was
+hardcoded in two `WriteText` lines instead of using the already-exported
+`AllowlistFileName` constant (a rename would have silently desynced the
+report text from the loader); `Allowlist.allows` had a redundant
+`a.paths != nil` guard — reading a nil Go map returns the zero value
+safely, so the guard added apparent-but-unnecessary caution. Both
+trivial, both fixed inline.
+
+**Consequences:** no change to the mechanism's core guarantees
+(exact-path-only matching, the self-write timing property, fail-safe
+parsing's accept/reject boundary) — all four findings were about
+robustness at the edges (a directory instead of a file, hundreds of
+entries instead of a handful) rather than the central design. Full
+suite re-verified green after all four fixes, including three new
+regression tests, not just the original ones.
+
+**If asked to defend this:** "The review's four findings were all
+robustness gaps at scale or on an untested input shape — a directory
+where a file was expected, more suppressed entries than the pipe buffer
+tolerates — not disputes with the core design. Fixed all four, added a
+regression test for each rather than trusting the fix by inspection, and
+re-ran the full suite before calling it done."
