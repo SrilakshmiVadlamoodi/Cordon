@@ -1859,3 +1859,68 @@ runtime forks for its own reasons — both stated in the code, not hidden."
 ---
 
 **Note (2026-09-11):** Both Phase 1 merges (`syscall-capture`, `behavior-report`) were fast-forwards, confirmed via `git reflog` to have been done correctly on real feature branches (checkout → commits → fast-forward merge → branch deleted) — recorded here since a fast-forward merge is indistinguishable from a direct-to-main commit once the branch ref is gone, which left this ambiguous to a later reader until the reflog was checked. Phase 2 merges use `--no-ff` so branch history stays visible in `git log` without needing the reflog.
+
+---
+
+## [2026-09-11] `.env` credential marker was missing — fixed, not deferred
+
+**Context:** Building the Phase 2 corpus expansion's `credential-marker-gap`
+category (a fixture meant to prove a real, currently-live gap in
+`credentialPathMarkers`), checked which common real-world secret stores
+the existing 13 markers actually cover. `.env` — the single most common
+secrets file in the Node/Python ecosystems Cordon targets (dotenv-style
+`API_KEY=...` files, read by nearly every framework's boot sequence) —
+was not among them. Any package install that reads a project's `.env`
+file today produces no `Credential file read` finding at all.
+
+**Options considered:**
+- **Document as an accepted Phase 2 gap**, matching how other taxonomy
+  refinements in `features/behavior-report/intent.md` are deferred.
+  Rejected: unlike the `.npmrc` false-positive (a precision judgment call
+  about a path that legitimately might not hold a secret), this is a
+  false *negative* on one of the most common real secret files that
+  exists — a coverage bug, not a taxonomy trade-off, and one line to fix.
+- **Add `/.env` to `credentialPathMarkers` now.** Chosen.
+
+**Chose:** Added `/.env` to the marker list (`internal/behaviorreport/report.go`),
+plus `TestGenerate_DotEnvRead_IsHigh` (unit) and the `credential-marker-gap`
+corpus fixture (end-to-end, asserts the real binary now reports a HIGH for
+a planted `.env` file with a fake key). This is a separate commit from the
+corpus-expansion work that surfaced it, per instruction: a rule bug fix and
+a test-corpus feature are two different kinds of change even though one
+led directly to the other.
+
+**Why now rather than deferred:** The distinction that matters is *why* a
+path is missing detection. `.npmrc` is flagged, matched, and *known* to
+sometimes be a false alarm — that's a documented precision trade-off with
+a real judgment call behind it. `.env` wasn't a judgment call at all; it
+simply wasn't in the list, and there's no legitimate reason a package
+install should be reading a project's dotenv file. Nothing about
+INTENT.md §1's "detection is best-effort" language excuses shipping a
+known, trivially-fixable hole in coverage of the most common secret file
+format there is.
+
+**Consequences:**
+- Easy: `.env` reads by an install now surface a HIGH the same way `.ssh`
+  or `.aws` reads already do — no new code path, just a new entry in an
+  existing list.
+- Same accepted imprecision as `.npmrc`, inherited rather than introduced:
+  `/.env` as a substring also matches `/.envrc` (a direnv shell-config
+  file, not a dotenv secrets file) — a false positive in the same family,
+  not fixed here, tracked alongside `.npmrc`'s existing caveat for Phase
+  2's allowlist/precision work.
+- Does not change the rule's fundamental shape (substring match on a
+  resolved path) or its scope (still only fires on an `openat`, so the
+  same syscall-capture visibility limits — untraced forked children,
+  namespace-tree gap — apply to `.env` reads exactly as they do to every
+  other marker).
+
+**If asked to defend this:** "Building a corpus fixture meant to
+demonstrate a marker gap, I found the gap was `.env` itself — the most
+common real-world secrets file for the ecosystems this tool targets,
+and it wasn't in the list at all. That's not a precision trade-off like
+`.npmrc`'s, it's a plain coverage bug with a one-line fix, so I fixed it
+in its own commit rather than writing a fixture that proves a hole I
+could close in the same sitting. It inherits `.npmrc`'s same kind of
+false-positive risk against `.envrc`, which I left as-is and logged
+rather than trying to solve two problems in one change."
