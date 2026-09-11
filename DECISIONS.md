@@ -2172,3 +2172,79 @@ where a file was expected, more suppressed entries than the pipe buffer
 tolerates — not disputes with the core design. Fixed all four, added a
 regression test for each rather than trusting the fix by inspection, and
 re-ran the full suite before calling it done."
+
+---
+
+## [2026-09-11] false-positive-rate: 0/8 on Cordon's own synthetic corpus, published as the repo's first README, deliberately not auto-regenerated
+
+**Context:** INTENT.md §2 names false-positive rate a headline metric,
+and §4 Phase 2 asks for it "measured and published in README" — nothing
+did either before this. `features/false-positive-rate/intent.md` has
+the full proposal and its approval; this entry is what actually shipped.
+
+**What "benign" means, concretely, and why 8 not more:** added an
+explicit `benign bool` to `corpusCase` rather than inferring it from
+`noHigh`. Labeled exactly 8 of the 18 existing cases:
+`benign-local-io` (×2), `network-egress` (×2), `native-build-style`
+(×2), `marker-precision` (×2). Deliberately did NOT label anything in
+`credential-read`, `credential-read-gap`, `credential-marker-gap`,
+`escalation-volume`, or `allowlist-mechanism` — every one of those
+exercises a real credential read, a documented detection miss, or a
+suppression, and inferring "no HIGH visible" as "benign" for, say,
+`pre-authored-suppresses` (`allowlist-mechanism`) would count a
+genuinely-read secret file as evidence of rule cleanliness just because
+the developer's own allowlist hid it. That's a different population
+than "the rule correctly recognized legitimate behavior," and folding
+them together would inflate the published number with cases that don't
+support the claim.
+
+**Where the number lives and how it's computed:** `TestCorpus_
+FalsePositiveRate` (`cmd/cordon/corpus_test.go`) iterates `corpusCases`
+— the *same* package-level slice `TestCorpus_BehaviorReport` already
+iterated (refactored out of that test's local variable into a shared
+var specifically so the two can't drift apart) — filters to
+`benign == true`, runs each fixture through the real binary, and
+`t.Log`s "N/M benign-labeled fixtures produced an unexpected HIGH
+finding." Also `t.Fatal`s if the benign count is ever 0, a guard against
+the label silently disappearing in a future refactor rather than the
+corpus genuinely having no benign cases. Current result: **0/8**.
+
+**README.md created — real, acknowledged scope, not an accident.** This
+is the first README this repository has ever had. Scoped narrowly, per
+instruction: the FP number, its population named in the same sentence,
+what it explicitly does not claim (not a real-registry sample, not
+statistically representative), and the exact recompute command. states
+plainly that Phase 3's fuller README (demo, full "what Cordon does not
+catch" list) is separate, later scope, not attempted here.
+
+**Auto-regeneration explicitly rejected, per instruction, in favor of
+naming the drift risk instead of engineering it away:** the README's
+number is a hand-pasted snapshot, not templated or rewritten by tooling.
+Considered and rejected: a small script that rewrites a marked README
+block from the test's output (removes drift entirely, but adds a
+maintenance surface — another script to keep correct — for a number
+that's already explicitly qualified as a manual, honestly-caveated
+snapshot). Chose to accept the drift risk and say so in the README
+itself: the `t.Log`ged line is authoritative if the two ever disagree,
+and the README states that outright rather than implying live accuracy
+it doesn't have.
+
+**Consequences:**
+- The published 0/8 will go stale the moment a new benign fixture is
+  added or an existing one's behavior changes, until someone re-runs the
+  test and re-pastes the number — an accepted, disclosed cost, not an
+  oversight.
+- `TestCorpus_BehaviorReport`'s refactor (local `cases` → package-level
+  `corpusCases`) is the only change to existing test structure; no
+  existing assertion changed, confirmed by a full, fresh test run before
+  this was called done.
+
+**If asked to defend this:** "The number is real — 0 of 8 fixtures we
+explicitly label as modeling legitimate behavior produce a false HIGH —
+but the population is Cordon's own synthetic corpus, not a sample of
+real npm or pip packages, and the README says so in the same sentence as
+the number, not a footnote. I was told not to build auto-regeneration
+for this, and I agree with the reasoning: it would add a maintenance
+surface for a number that's already explicitly labeled as a manual
+snapshot. The test that recomputes it is one command away, named
+inline, and is the authority if the README ever falls behind it."

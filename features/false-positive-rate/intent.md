@@ -20,28 +20,45 @@ this feature publishes must say so in the same sentence it's given, not
 in a footnote a reader can skip past.
 
 **Done:**
-- [ ] Each `corpusCase` in `cmd/cordon/corpus_test.go` carries an
+- [x] Each `corpusCase` in `cmd/cordon/corpus_test.go` carries an
       explicit `benign bool` label — not inferred from `noHigh` or the
       absence of a `wantHit` HIGH, since inference would conflate
       "deliberately clean" with incidental non-HIGH cases that mean
       something different (an allowlist-suppressed finding, a documented
       detection miss) that must not silently count toward a false-clean
       population
-- [ ] A dedicated test walks exactly the `benign`-labeled subset and
-      `t.Log`s the count on every run — "false positives: N/M
-      benign-labeled fixtures produced an unexpected HIGH finding" —
-      so the number is recomputed by the act of running `go test`, never
-      hand-counted and never silently stale relative to the table it's
-      drawn from
-- [ ] A minimal `README.md` states the current number with its
+      *(8 of 18 cases labeled: `benign-local-io` ×2, `network-egress`
+      ×2, `native-build-style` ×2, `marker-precision` ×2. Deliberately
+      NOT the `allowlist-mechanism`, `credential-read`,
+      `credential-read-gap`, `credential-marker-gap`, or
+      `escalation-volume` groups — each of those either exercises a real
+      credential read, a documented miss, or a suppression, none of
+      which is "legitimate behavior the rule should recognize as
+      clean.")*
+- [x] A dedicated test walks exactly the `benign`-labeled subset and
+      `t.Log`s the count on every run, so the number is recomputed by
+      the act of running `go test`, never hand-counted and never
+      silently stale relative to the table it's drawn from
+      *(`TestCorpus_FalsePositiveRate`, `cmd/cordon/corpus_test.go` —
+      shares `corpusCases` with `TestCorpus_BehaviorReport` rather than
+      keeping a second list, so the two can't drift from each other;
+      current result 0/8, also `t.Fatal`s if the benign count is ever 0,
+      guarding against the label being silently lost rather than the
+      corpus genuinely having none)*
+- [x] A minimal `README.md` states the current number with its
       population named in the same sentence: which corpus, how many
       fixtures, and that it is Cordon's own synthetic archetypes, not a
       measurement against real registry packages
-- [ ] The same section states plainly what the number does *not* claim:
+      *(`README.md`, "False-positive rate" section — this is the repo's
+      first README, created as real scope for this feature, not an
+      incidental side effect)*
+- [x] The same section states plainly what the number does *not* claim:
       not validated against any real npm/pip package, not a statistical
       sample of any registry, and only as current as the last deliberate
       re-run — with the exact test command that recomputes it named
       inline, not just implied
+      *(same README section, "What this number is not a statement
+      about" + the exact `go test` invocation)*
 
 **Constraints (slice-specific):**
 - This is **not** Phase 3's README. INTENT.md §4 Phase 3 separately asks

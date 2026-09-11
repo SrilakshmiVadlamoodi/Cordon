@@ -137,220 +137,242 @@ type corpusCase struct {
 	wantEmpty     bool // assert the literal "No findings." line
 	minUnobserved int  // if > 0, assert unobservedCount(t, report) >= this
 	firstIsHigh   bool // assert the first finding line is a HIGH
+
+	// benign is an explicit label for features/false-positive-rate: this
+	// fixture models legitimate install behavior that should never
+	// produce a HIGH finding. Deliberately NOT inferred from noHigh or
+	// the absence of a HIGH wantHit — inference would wrongly fold in
+	// cases that are non-HIGH for an unrelated reason (an
+	// allowlist-suppressed finding, a documented detection miss) into a
+	// "clean" population they don't belong to. Only a case explicitly
+	// marked benign counts toward the false-positive rate.
+	benign bool
+}
+
+// corpusCases is the single table both TestCorpus_BehaviorReport and
+// TestCorpus_FalsePositiveRate iterate — one ground truth, so the
+// published false-positive count can never drift from what the corpus
+// actually asserts elsewhere.
+var corpusCases = []corpusCase{
+	// --- benign-local-io ---
+	{
+		name:      "noop-install: no findings",
+		group:     "benign-local-io",
+		file:      "noop-install",
+		wantEmpty: true,
+		noHigh:    true,
+		noMedium:  true,
+		benign:    true,
+	},
+	{
+		name:     "local-file-writes: no high/medium",
+		group:    "benign-local-io",
+		file:     "local-file-writes",
+		noHigh:   true,
+		noMedium: true,
+		benign:   true,
+	},
+
+	// --- network-egress ---
+	{
+		name:  "bare-connect: medium, not escalated",
+		group: "network-egress",
+		file:  "bare-connect",
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[MEDIUM] Network connection", detailSubstr: "203.0.113.7:443"},
+		},
+		noHigh: true,
+		benign: true,
+	},
+	{
+		name:  "multi-host-connect: three distinct MEDIUMs, no escalation",
+		group: "network-egress",
+		file:  "multi-host-connect",
+		wantHit: []ruleAssertion{
+			{titleSubstr: "203.0.113.30:443"},
+			{titleSubstr: "203.0.113.31:443"},
+			{titleSubstr: "203.0.113.32:80"},
+		},
+		noHigh: true,
+		benign: true,
+	},
+
+	// --- native-build-style ---
+	{
+		name:  "faux-node-gyp: medium egress, no high, descendants reported",
+		group: "native-build-style",
+		file:  "faux-node-gyp",
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[MEDIUM] Network connection", detailSubstr: "203.0.113.11:443"},
+		},
+		noHigh:        true,
+		minUnobserved: 2,
+		benign:        true,
+	},
+	{
+		name:     "temp-artifact-build: high /tmp churn, still no finding",
+		group:    "native-build-style",
+		file:     "temp-artifact-build",
+		noHigh:   true,
+		noMedium: true,
+		benign:   true,
+	},
+
+	// --- credential-read ---
+	{
+		name:  "direct-read-and-exfil: two highs at the top",
+		group: "credential-read",
+		file:  "direct-read-and-exfil",
+		plant: plantSSHKey,
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+			{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.21:443"},
+		},
+		firstIsHigh: true,
+	},
+	{
+		name:  "direct-read-no-network: high, no exfil, no medium",
+		group: "credential-read",
+		file:  "direct-read-no-network",
+		plant: plantNpmrc,
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".npmrc"},
+		},
+		noMedium: true,
+		wantMiss: []expectedMiss{
+			{titleSubstr: "Possible credential exfiltration",
+				reason: "no network connection was made in this run, so Rule 2's escalation correlation has nothing to pair with — this is the ordinary non-escalation case, not a detection gap"},
+		},
+	},
+	{
+		name:  "multi-secret: two distinct HIGHs, deduped, no network",
+		group: "credential-read",
+		file:  "multi-secret",
+		plant: func(dir string) { plantSSHKey(dir); plantAWSCreds(dir) },
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: "credentials"},
+		},
+		noMedium: true,
+	},
+
+	// --- credential-marker-gap (the .env fix, proven) ---
+	{
+		name:  "dotenv-read: .env now recognized as a credential marker",
+		group: "credential-marker-gap",
+		file:  "dotenv-read",
+		plant: plantDotEnv,
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".env"},
+		},
+	},
+
+	// --- credential-read-gap (expected miss) ---
+	{
+		name:  "subprocess-read: credential read in a forked child is NOT detected",
+		group: "credential-read-gap",
+		file:  "subprocess-read",
+		plant: plantSSHKey,
+		wantMiss: []expectedMiss{
+			{titleSubstr: "Credential file read",
+				reason: "syscall-capture's tracing scope covers only the single directly-launched process and its own OS threads (features/syscall-capture/intent.md 'Scope split', DECISIONS.md 2026-09-04); a forked child's own openat is auto-attached-and-released, never read. Closing this requires features/syscall-capture-tree, not yet built."},
+		},
+		minUnobserved: 1,
+	},
+
+	// --- marker-precision (false-positive hedge) ---
+	{
+		name:     "known-hosts: adjacent to a marker, not a match",
+		group:    "marker-precision",
+		file:     "known-hosts",
+		plant:    plantKnownHosts,
+		noHigh:   true,
+		noMedium: true,
+		benign:   true,
+	},
+	{
+		name:     "generic-config: adjacent to the gcloud marker, not a match",
+		group:    "marker-precision",
+		file:     "generic-config",
+		noHigh:   true,
+		noMedium: true,
+		benign:   true,
+	},
+
+	// --- escalation-volume ---
+	{
+		name:  "multi-secret-multi-host: dedup and ordering hold at volume",
+		group: "escalation-volume",
+		file:  "multi-secret-multi-host",
+		plant: func(dir string) { plantSSHKey(dir); plantAWSCreds(dir); plantNpmrc(dir) },
+		wantHit: []ruleAssertion{
+			{titleSubstr: "id_rsa"},
+			{titleSubstr: "credentials"},
+			{titleSubstr: ".npmrc"},
+			{titleSubstr: "203.0.113.40:443"},
+			{titleSubstr: "203.0.113.41:443"},
+			{titleSubstr: "203.0.113.42:443"},
+		},
+		firstIsHigh: true,
+	},
+
+	// --- allowlist-mechanism ---
+	{
+		name:  "pre-authored-suppresses: standalone finding suppressed, named in report",
+		group: "allowlist-mechanism",
+		file:  "pre-authored-suppresses",
+		plant: plantSSHKeyPreAllowlisted,
+		wantContain: []string{
+			"SUPPRESSED BY ALLOWLIST (1)",
+			"[Credential file read]",
+		},
+		noHigh:   true,
+		noMedium: true,
+	},
+	{
+		name:  "still-correlates-with-network: allowlisting does not suppress exfil correlation",
+		group: "allowlist-mechanism",
+		file:  "still-correlates-with-network",
+		plant: plantSSHKeyPreAllowlisted,
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.50:443"},
+			{titleSubstr: "[MEDIUM] Network connection"},
+		},
+		wantContain: []string{"SUPPRESSED BY ALLOWLIST (1)"},
+		wantAbsent:  []string{"[HIGH] Credential file read"},
+		firstIsHigh: true,
+	},
+	{
+		name:  "self-write-too-late: mid-run allowlist edit has no effect on this run (3b regression)",
+		group: "allowlist-mechanism",
+		file:  "self-write-too-late",
+		plant: plantSSHKey, // no allowlist planted ahead of time -- the fixture writes its own
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+		},
+		wantAbsent: []string{"SUPPRESSED BY ALLOWLIST"},
+	},
+	{
+		name:  "malformed-entries-ignored: invalid entry stays flagged, valid entry suppresses",
+		group: "allowlist-mechanism",
+		file:  "malformed-entries-ignored",
+		plant: plantMalformedAllowlist,
+		wantHit: []ruleAssertion{
+			{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
+		},
+		wantContain: []string{
+			"SUPPRESSED BY ALLOWLIST (1)",
+			"1 entry(ies) in .cordon-allowlist were ignored",
+		},
+		wantAbsent: []string{"SUPPRESSED BY ALLOWLIST (2)"},
+	},
 }
 
 func TestCorpus_BehaviorReport(t *testing.T) {
 	requireUserNS(t)
 	cordonBin := buildCordon(t)
 
-	cases := []corpusCase{
-		// --- benign-local-io ---
-		{
-			name:      "noop-install: no findings",
-			group:     "benign-local-io",
-			file:      "noop-install",
-			wantEmpty: true,
-			noHigh:    true,
-			noMedium:  true,
-		},
-		{
-			name:     "local-file-writes: no high/medium",
-			group:    "benign-local-io",
-			file:     "local-file-writes",
-			noHigh:   true,
-			noMedium: true,
-		},
-
-		// --- network-egress ---
-		{
-			name:  "bare-connect: medium, not escalated",
-			group: "network-egress",
-			file:  "bare-connect",
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[MEDIUM] Network connection", detailSubstr: "203.0.113.7:443"},
-			},
-			noHigh: true,
-		},
-		{
-			name:  "multi-host-connect: three distinct MEDIUMs, no escalation",
-			group: "network-egress",
-			file:  "multi-host-connect",
-			wantHit: []ruleAssertion{
-				{titleSubstr: "203.0.113.30:443"},
-				{titleSubstr: "203.0.113.31:443"},
-				{titleSubstr: "203.0.113.32:80"},
-			},
-			noHigh: true,
-		},
-
-		// --- native-build-style ---
-		{
-			name:  "faux-node-gyp: medium egress, no high, descendants reported",
-			group: "native-build-style",
-			file:  "faux-node-gyp",
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[MEDIUM] Network connection", detailSubstr: "203.0.113.11:443"},
-			},
-			noHigh:        true,
-			minUnobserved: 2,
-		},
-		{
-			name:     "temp-artifact-build: high /tmp churn, still no finding",
-			group:    "native-build-style",
-			file:     "temp-artifact-build",
-			noHigh:   true,
-			noMedium: true,
-		},
-
-		// --- credential-read ---
-		{
-			name:  "direct-read-and-exfil: two highs at the top",
-			group: "credential-read",
-			file:  "direct-read-and-exfil",
-			plant: plantSSHKey,
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
-				{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.21:443"},
-			},
-			firstIsHigh: true,
-		},
-		{
-			name:  "direct-read-no-network: high, no exfil, no medium",
-			group: "credential-read",
-			file:  "direct-read-no-network",
-			plant: plantNpmrc,
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".npmrc"},
-			},
-			noMedium: true,
-			wantMiss: []expectedMiss{
-				{titleSubstr: "Possible credential exfiltration",
-					reason: "no network connection was made in this run, so Rule 2's escalation correlation has nothing to pair with — this is the ordinary non-escalation case, not a detection gap"},
-			},
-		},
-		{
-			name:  "multi-secret: two distinct HIGHs, deduped, no network",
-			group: "credential-read",
-			file:  "multi-secret",
-			plant: func(dir string) { plantSSHKey(dir); plantAWSCreds(dir) },
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "credentials"},
-			},
-			noMedium: true,
-		},
-
-		// --- credential-marker-gap (the .env fix, proven) ---
-		{
-			name:  "dotenv-read: .env now recognized as a credential marker",
-			group: "credential-marker-gap",
-			file:  "dotenv-read",
-			plant: plantDotEnv,
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: ".env"},
-			},
-		},
-
-		// --- credential-read-gap (expected miss) ---
-		{
-			name:  "subprocess-read: credential read in a forked child is NOT detected",
-			group: "credential-read-gap",
-			file:  "subprocess-read",
-			plant: plantSSHKey,
-			wantMiss: []expectedMiss{
-				{titleSubstr: "Credential file read",
-					reason: "syscall-capture's tracing scope covers only the single directly-launched process and its own OS threads (features/syscall-capture/intent.md 'Scope split', DECISIONS.md 2026-09-04); a forked child's own openat is auto-attached-and-released, never read. Closing this requires features/syscall-capture-tree, not yet built."},
-			},
-			minUnobserved: 1,
-		},
-
-		// --- marker-precision (false-positive hedge) ---
-		{
-			name:     "known-hosts: adjacent to a marker, not a match",
-			group:    "marker-precision",
-			file:     "known-hosts",
-			plant:    plantKnownHosts,
-			noHigh:   true,
-			noMedium: true,
-		},
-		{
-			name:     "generic-config: adjacent to the gcloud marker, not a match",
-			group:    "marker-precision",
-			file:     "generic-config",
-			noHigh:   true,
-			noMedium: true,
-		},
-
-		// --- escalation-volume ---
-		{
-			name:  "multi-secret-multi-host: dedup and ordering hold at volume",
-			group: "escalation-volume",
-			file:  "multi-secret-multi-host",
-			plant: func(dir string) { plantSSHKey(dir); plantAWSCreds(dir); plantNpmrc(dir) },
-			wantHit: []ruleAssertion{
-				{titleSubstr: "id_rsa"},
-				{titleSubstr: "credentials"},
-				{titleSubstr: ".npmrc"},
-				{titleSubstr: "203.0.113.40:443"},
-				{titleSubstr: "203.0.113.41:443"},
-				{titleSubstr: "203.0.113.42:443"},
-			},
-			firstIsHigh: true,
-		},
-
-		// --- allowlist-mechanism ---
-		{
-			name:  "pre-authored-suppresses: standalone finding suppressed, named in report",
-			group: "allowlist-mechanism",
-			file:  "pre-authored-suppresses",
-			plant: plantSSHKeyPreAllowlisted,
-			wantContain: []string{
-				"SUPPRESSED BY ALLOWLIST (1)",
-				"[Credential file read]",
-			},
-			noHigh:   true,
-			noMedium: true,
-		},
-		{
-			name:  "still-correlates-with-network: allowlisting does not suppress exfil correlation",
-			group: "allowlist-mechanism",
-			file:  "still-correlates-with-network",
-			plant: plantSSHKeyPreAllowlisted,
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Possible credential exfiltration", detailSubstr: "203.0.113.50:443"},
-				{titleSubstr: "[MEDIUM] Network connection"},
-			},
-			wantContain: []string{"SUPPRESSED BY ALLOWLIST (1)"},
-			wantAbsent:  []string{"[HIGH] Credential file read"},
-			firstIsHigh: true,
-		},
-		{
-			name:  "self-write-too-late: mid-run allowlist edit has no effect on this run (3b regression)",
-			group: "allowlist-mechanism",
-			file:  "self-write-too-late",
-			plant: plantSSHKey, // no allowlist planted ahead of time -- the fixture writes its own
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
-			},
-			wantAbsent: []string{"SUPPRESSED BY ALLOWLIST"},
-		},
-		{
-			name:  "malformed-entries-ignored: invalid entry stays flagged, valid entry suppresses",
-			group: "allowlist-mechanism",
-			file:  "malformed-entries-ignored",
-			plant: plantMalformedAllowlist,
-			wantHit: []ruleAssertion{
-				{titleSubstr: "[HIGH] Credential file read", detailSubstr: "id_rsa"},
-			},
-			wantContain: []string{
-				"SUPPRESSED BY ALLOWLIST (1)",
-				"1 entry(ies) in .cordon-allowlist were ignored",
-			},
-			wantAbsent: []string{"SUPPRESSED BY ALLOWLIST (2)"},
-		},
-	}
-
-	for _, c := range cases {
+	for _, c := range corpusCases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			r := runCorpusFixture(t, cordonBin, c.group, c.file, c.plant)
@@ -402,6 +424,47 @@ func TestCorpus_BehaviorReport(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCorpus_FalsePositiveRate computes and logs Cordon's false-positive
+// rate on its own synthetic corpus (features/false-positive-rate/
+// intent.md): the fraction of benign-labeled corpusCases (see
+// corpusCase.benign) that produce an unexpected HIGH finding. It shares
+// corpusCases with TestCorpus_BehaviorReport rather than keeping a
+// separate list, so this number can never silently drift from what the
+// rest of the corpus actually asserts.
+//
+// This is emphatically NOT a measurement against real npm/pip registry
+// packages -- every fixture here is synthetic and self-authored
+// (DECISIONS.md 2026-09-05, corpus-expansion/intent.md). The number this
+// test logs describes exactly one thing: how Cordon's own rules classify
+// the specific benign archetypes this project deliberately built to
+// represent legitimate install behavior. See README.md's own caveats
+// before citing this number anywhere else.
+func TestCorpus_FalsePositiveRate(t *testing.T) {
+	requireUserNS(t)
+	cordonBin := buildCordon(t)
+
+	var total, falsePositives int
+	for _, c := range corpusCases {
+		if !c.benign {
+			continue
+		}
+		total++
+		r := runCorpusFixture(t, cordonBin, c.group, c.file, c.plant)
+		if strings.Contains(r, "[HIGH]") {
+			falsePositives++
+			t.Errorf("benign-labeled fixture %q produced a HIGH finding (false positive):\n%s", c.name, r)
+		}
+	}
+
+	if total == 0 {
+		t.Fatal("no corpusCase is labeled benign -- the false-positive-rate metric has nothing to measure; " +
+			"this almost certainly means the benign label was lost, not that the corpus genuinely has none")
+	}
+	t.Logf("false-positive rate on Cordon's synthetic benign-archetype corpus (testdata/corpus/, "+
+		"NOT a measurement against real registry packages): %d/%d benign-labeled fixtures produced "+
+		"an unexpected HIGH finding", falsePositives, total)
 }
 
 // TestCorpus_DelayedProcess_DoesNotOutliveTheRun is a dedicated test, not
