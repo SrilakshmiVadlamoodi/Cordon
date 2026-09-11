@@ -18,6 +18,14 @@ import (
 	"github.com/SrilakshmiVadlamoodi/cordon/internal/syscallcapture"
 )
 
+// maxRenderedFindings caps both the Findings and Suppressed render loops
+// in WriteText. The report crosses a pipe with a fixed buffer and is
+// read only after the writer exits (sandbox.Run's cmd.Wait then
+// io.ReadAll), so an unbounded render of either list — hundreds of
+// distinct connect targets, or a developer allowlisting many distinct
+// paths under one broad marker like /.gnupg/ — could deadlock it.
+const maxRenderedFindings = 100
+
 // Severity is coarse on purpose for the MVP.
 type Severity int
 
@@ -240,10 +248,9 @@ func (r Report) WriteText(w io.Writer) {
 		// unbounded render (a run that connects to hundreds of distinct
 		// hosts) could deadlock. Highest-severity findings sort first, so
 		// the cap only ever drops lower-severity tail entries.
-		const maxRendered = 100
 		shown := r.Findings
-		if len(shown) > maxRendered {
-			shown = shown[:maxRendered]
+		if len(shown) > maxRenderedFindings {
+			shown = shown[:maxRenderedFindings]
 		}
 		for _, f := range shown {
 			fmt.Fprintf(w, "  [%s] %s\n", f.Severity, f.Title)
@@ -252,18 +259,30 @@ func (r Report) WriteText(w io.Writer) {
 			}
 			fmt.Fprintln(w)
 		}
-		if len(r.Findings) > maxRendered {
-			fmt.Fprintf(w, "  ... and %d more finding(s) not shown.\n\n", len(r.Findings)-maxRendered)
+		if len(r.Findings) > maxRenderedFindings {
+			fmt.Fprintf(w, "  ... and %d more finding(s) not shown.\n\n", len(r.Findings)-maxRenderedFindings)
 		}
 	}
 
 	if len(r.Suppressed) > 0 {
 		fmt.Fprintf(w, "SUPPRESSED BY ALLOWLIST (%d)\n\n", len(r.Suppressed))
-		for _, s := range r.Suppressed {
+		// Same cap and rationale as Findings above: this crosses the same
+		// fixed-size pipe, read only after the writer exits, so an
+		// unbounded render (a developer allowlisting many distinct paths
+		// under one broad marker, e.g. /.gnupg/) could deadlock it exactly
+		// as an uncapped Findings list could.
+		shown := r.Suppressed
+		if len(shown) > maxRenderedFindings {
+			shown = shown[:maxRenderedFindings]
+		}
+		for _, s := range shown {
 			fmt.Fprintf(w, "  [%s] %s\n", s.Title, s.Path)
 		}
+		if len(r.Suppressed) > maxRenderedFindings {
+			fmt.Fprintf(w, "  ... and %d more suppressed entry(ies) not shown.\n", len(r.Suppressed)-maxRenderedFindings)
+		}
 		fmt.Fprintln(w, "  A finding above was withheld because its exact path is listed in this")
-		fmt.Fprintln(w, "  project's .cordon-allowlist. This does not affect any 'Possible credential")
+		fmt.Fprintf(w, "  project's %s. This does not affect any 'Possible credential\n", AllowlistFileName)
 		fmt.Fprintln(w, "  exfiltration' finding, which still considers this path if it was also")
 		fmt.Fprintln(w, "  involved in a network connection this run.")
 		fmt.Fprintln(w)
@@ -291,7 +310,7 @@ func (r Report) WriteText(w io.Writer) {
 	fmt.Fprintln(w, "  - Detection is best-effort by design (INTENT.md §1): a determined package")
 	fmt.Fprintln(w, "    can act through syscalls Cordon does not watch, or through a child process.")
 	if r.AllowlistIgnored > 0 {
-		fmt.Fprintf(w, "  - %d entry(ies) in .cordon-allowlist were ignored (not an absolute path to\n", r.AllowlistIgnored)
+		fmt.Fprintf(w, "  - %d entry(ies) in %s were ignored (not an absolute path to\n", r.AllowlistIgnored, AllowlistFileName)
 		fmt.Fprintln(w, "    a file that exists) and treated as NOT allowlisted -- any matching path")
 		fmt.Fprintln(w, "    stays flagged as usual.")
 	}

@@ -2106,3 +2106,69 @@ and the regression test confirms the finding still fires. Fail-safe
 parsing got the same treatment — a unit test that plants a real missing
 file, not just a well-formed one, to prove an invalid entry leaves the
 path flagged rather than silently exempting it."
+
+---
+
+## [2026-09-11] /code-review ultra findings on allowlist-mechanism: directory entries, the pipe-deadlock cap, and two nits
+
+**Context:** `/code-review ultra` against `allowlist-mechanism` before
+merge. Four findings, all "nit" severity, none disputing the core
+design (self-write timing, Rule 1/Rule 2 interaction) — a useful signal
+that the parts already stress-tested by direct reproduction held up,
+and the review caught the parts that weren't.
+
+**1. `LoadAllowlist` accepted directory entries as valid (real bug).**
+`os.Stat` doesn't distinguish a file from a directory; a line naming a
+real directory (e.g. `/proj/.gnupg`) passed both the `IsAbs` and `Stat`
+checks and was inserted into the allow-set, despite the doc comment's
+explicit "a file actually exists there" and intent.md's "no directory
+prefixes." It could never actually suppress anything (the map lookup
+needs an exact match against a file path an `openat` produced), so the
+practical damage was narrow — but it also silently failed to increment
+`Ignored`, defeating the one thing `AllowlistIgnored` exists to
+guarantee: a developer whose entry does nothing can tell why. Fixed by
+checking `info.IsDir()` alongside the existing `os.Stat` error check.
+`TestLoadAllowlist_DirectoryEntryIsIgnoredNotApplied` plants a real
+directory (not a mock) and confirms both the `Ignored` count and that a
+file inside it stays flagged.
+
+**2. `SUPPRESSED BY ALLOWLIST` rendered unbounded, undermining the
+`Findings` cap's own stated invariant (real bug, not yet exploitable at
+observed scale but a real inconsistency).** `WriteText`'s `Findings`
+loop caps at 100 specifically because the report crosses a fixed-size
+pipe and is read only after the writer exits (`sandbox.Run`'s
+`cmd.Wait` then `io.ReadAll`) — an unbounded render could deadlock it.
+The `Suppressed` loop added by this feature had no such cap, so a
+developer allowlisting many distinct paths under one broad marker
+(`/.gnupg/` matches an entire keyring directory's contents) could in
+principle reproduce the exact deadlock the `Findings` cap exists to
+prevent. Fixed by hoisting the cap to a package-level
+`maxRenderedFindings` constant shared by both loops, with the same
+"...and N more not shown" tail line. `TestReport_WriteText_
+SuppressedListIsCapped` builds 105 real allowlisted paths and confirms
+`Generate` itself is uncapped (all 105 in `Report.Suppressed`) while
+`WriteText`'s render stops at 100 with a tail line for the remaining 5
+— the cap is a rendering concern, not a classification one.
+
+**3 & 4. Two nits, both fixed:** the literal `".cordon-allowlist"` was
+hardcoded in two `WriteText` lines instead of using the already-exported
+`AllowlistFileName` constant (a rename would have silently desynced the
+report text from the loader); `Allowlist.allows` had a redundant
+`a.paths != nil` guard — reading a nil Go map returns the zero value
+safely, so the guard added apparent-but-unnecessary caution. Both
+trivial, both fixed inline.
+
+**Consequences:** no change to the mechanism's core guarantees
+(exact-path-only matching, the self-write timing property, fail-safe
+parsing's accept/reject boundary) — all four findings were about
+robustness at the edges (a directory instead of a file, hundreds of
+entries instead of a handful) rather than the central design. Full
+suite re-verified green after all four fixes, including three new
+regression tests, not just the original ones.
+
+**If asked to defend this:** "The review's four findings were all
+robustness gaps at scale or on an untested input shape — a directory
+where a file was expected, more suppressed entries than the pipe buffer
+tolerates — not disputes with the core design. Fixed all four, added a
+regression test for each rather than trusting the fix by inspection, and
+re-ran the full suite before calling it done."
