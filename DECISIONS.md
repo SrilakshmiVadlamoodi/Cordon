@@ -2327,3 +2327,110 @@ for this, and I agree with the reasoning: it would add a maintenance
 surface for a number that's already explicitly labeled as a manual
 snapshot. The test that recomputes it is one command away, named
 inline, and is the authority if the README ever falls behind it."
+
+---
+
+## [2026-09-13] env-path-forwarding: caller's PATH now bind-mounted and forwarded — a deliberate widening of the sandbox's read-only surface
+
+**Context:** Planning `github-action` (Phase 3), the standard way a real
+CI workflow gets a pinned Node version is `actions/setup-node`, which
+installs into `$RUNNER_TOOL_CACHE` (typically under
+`/opt/hostedtoolcache/...`) and prepends that directory to `PATH`. Before
+this change, `childEnv` hardcoded the wrapped command's `PATH` to a fixed
+`defaultPath` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`)
+and discarded the caller's real `PATH` entirely, and `roSystemDirs`
+bind-mounted only `/bin /sbin /lib /lib64 /usr /etc`. Both were named,
+known gaps (`sandbox.go`'s standing `childEnv` comment; the
+`$npm_node_execpath` finding, DECISIONS.md 2026-09-04) but not yet a
+blocker for anything shipped. They became one here: on the default path
+through a GitHub Action using `actions/setup-node`, `cordon run npm
+install` would fail to resolve `npm`/`node` at all — not a corner case,
+the common case for that Action's primary audience.
+
+**Options considered:**
+- **Document the gap in the Action's own README/error output, fix later.**
+  Rejected: this isn't a rare workload tripping over a documented
+  limitation, it's the *default* configuration failing on the *first*
+  real external-facing surface Cordon ships. Shipping that and calling it
+  known-limitation framing would be misleading, not honest — the failure
+  mode is "the wrapper doesn't wrap," not a missed edge case.
+- **Forward the caller's entire environment.** Rejected outright, not
+  just deferred: env vars routinely carry secrets (API tokens, cloud
+  credentials in CI), and forwarding them into the sandboxed process is
+  exactly the exposure INTENT.md §1's isolation boundary exists to
+  prevent. Never proposed as a real option.
+- **Forward only `PATH` directory contents, read-only, bind-mounted the
+  same way `roSystemDirs` already are** (chosen).
+
+**Chose:** `sandbox.Run` (`run_linux.go:142`) now captures
+`os.Getenv("PATH")` and computes `extraPathDirs` — the caller's `PATH`
+entries not already covered by `roSystemDirs` or `defaultPath` (exact
+match or nested under either, via `underAny`, `run_linux.go:104`),
+deduplicated, order-preserved. That list crosses into `childConfig` as
+`ExtraPathDirs`, the same JSON-over-`childEnvVar` mechanism
+`Command`/`ProjectDir`/`NewRoot` already use. `setupRootfs`
+(`run_linux.go`, step 3) bind-mounts each one read-only at its own
+absolute host path, exactly like `roSystemDirs`, and `sandboxPath`
+(new helper) builds `defaultPath` + those extra directories for both
+`runChild`'s own `exec.LookPath(cfg.Command[0])` resolution
+(`run_linux.go:308`) and `childEnv`'s `PATH` for the wrapped command
+itself — both call sites had to change together, since a command that
+only resolves via a forwarded directory would otherwise fail at the
+top-level `LookPath` before ever reaching `childEnv`.
+
+**When the read happens, and why that matters (same shape as the
+allowlist's TOCTOU argument, DECISIONS.md 2026-09-11):** the
+`os.Getenv("PATH")` read is in `sandbox.Run`, the host-side, pre-namespace
+parent process, before `childConfig` is even marshaled (`run_linux.go:144`)
+and long before `cmd.Start()` (`run_linux.go:211`). At that point no
+namespace, no re-exec'd child, no tracee, and no wrapped-command process
+exists yet — strictly earlier than the allowlist's own read-before-tracee
+point, which happens inside the already-re-exec'd, already-namespaced
+`runChild` (`run_linux.go:326`). The wrapped command therefore cannot
+influence which directories get bind-mounted for its own run under any
+circumstance: the list is fixed before the sandbox's process tree exists
+at all, not merely before the tracee's first syscall. No adversarial
+write-race is even conceivable here the way one was for
+`.cordon-allowlist` (a file the wrapped command could write to); `PATH`
+is read once from the parent's own environment and never touched again.
+
+**Consequences — the tradeoff, logged as one, not a silent side effect:**
+- **The sandbox's read-only-visible surface is now caller-dependent, not
+  a fixed, fully-audited allowlist.** Before this change, exactly six
+  directories (`roSystemDirs`) were ever bind-mounted, chosen and
+  reviewed as a fixed set. Now, whatever the invoking user's or CI
+  runner's `PATH` happens to contain also becomes readable inside the
+  sandbox. This is the invoker's own `PATH`, not attacker-influenced
+  input (see the TOCTOU argument above), but it is a real change to what
+  "isolation is a hard boundary" (INTENT.md §1) actually bounds in
+  practice — a caller with an unusually broad `PATH` widens the sandbox's
+  visibility accordingly, without Cordon itself choosing or reviewing
+  those directories.
+- Mitigated, not eliminated, by scope: `PATH` directory contents only,
+  read-only, never arbitrary env vars — a compromised install can read
+  more of the filesystem than the old fixed set, but still cannot exfiltrate
+  anything via an environment variable Cordon declined to forward, and
+  still cannot write anywhere outside the project dir/tmp.
+- Easy now: `github-action`'s primary use case (wrapping an
+  `actions/setup-node`-configured install) actually works; a tool
+  resolved only via a forwarded `PATH` entry now runs both as the
+  top-level wrapped command and as a process it forks (proven separately
+  — see Done checklist).
+- Watch for later: if `syscall-capture-tree` or a future feature ever
+  needs to reason precisely about "everything the sandboxed process could
+  read," this feature means that answer is no longer a fixed compile-time
+  list — it depends on the invoking environment's `PATH` at run time.
+
+**If asked to defend this:** "The Action's own primary use case —
+wrapping an install after `actions/setup-node` — would have failed by
+default, because Node installed into a CI tool-cache path was never
+bind-mounted or on the sandbox's PATH. The fix forwards only PATH
+directory contents, read-only, captured in the host-side parent process
+before any namespace or tracee exists — so the wrapped command can never
+influence which directories get mounted for its own run, the same
+TOCTOU shape as the allowlist's read-before-tracee guarantee. The real
+cost is that the sandbox's readable surface is no longer a fixed,
+Cordon-reviewed set of six directories; it now depends on whatever the
+invoker's PATH contains. That's a deliberate, logged tradeoff — read-only
+and env-var-forwarding excluded on purpose — not a scope creep we didn't
+notice."
