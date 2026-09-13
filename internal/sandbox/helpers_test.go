@@ -3,28 +3,22 @@
 package sandbox_test
 
 import (
-	"os"
-	"strings"
 	"testing"
+
+	"github.com/SrilakshmiVadlamoodi/cordon/internal/sandbox"
 )
 
 // requireUserNS skips the test when the kernel or distro policy forbids
 // unprivileged user namespaces, so a CI failure points at the environment
-// rather than at Cordon (INTENT.md §3 Platform).
+// rather than at Cordon (INTENT.md §3 Platform). Delegates to
+// sandbox.CheckUserNamespacesAvailableForTest so the test-skip condition
+// and Run's own production-path error (run_linux.go's
+// checkUserNamespacesAvailable) read the exact same two sysctls, via the
+// exact same code, rather than two hand-copied checks that could silently
+// drift apart from each other.
 func requireUserNS(t *testing.T) {
 	t.Helper()
-
-	// Older Debian/Ubuntu: a global on/off switch.
-	if b, err := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone"); err == nil {
-		if strings.TrimSpace(string(b)) == "0" {
-			t.Skip("unprivileged user namespaces disabled (kernel.unprivileged_userns_clone=0)")
-		}
-	}
-	// Ubuntu 23.10+/24.04: AppArmor gates unprivileged userns for
-	// unconfined binaries even when the kernel supports it.
-	if b, err := os.ReadFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); err == nil {
-		if strings.TrimSpace(string(b)) == "1" {
-			t.Skip("unprivileged user namespaces restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns=1)")
-		}
+	if err := sandbox.CheckUserNamespacesAvailableForTest(); err != nil {
+		t.Skip(err.Error())
 	}
 }
