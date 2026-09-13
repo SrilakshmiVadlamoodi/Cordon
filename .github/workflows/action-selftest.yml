@@ -1,0 +1,72 @@
+name: github-action self-test
+
+# Exercises this repo's own action.yml end-to-end on GitHub's hosted
+# runner, both proving the composite action works at all and serving as
+# the concrete "Cordon runs on Cordon's own CI" Phase 3 item
+# (INTENT.md §4) as a byproduct — the first real, non-local proof of
+# whether unprivileged user namespaces are available on ubuntu-latest,
+# or the AppArmor gate (INTENT.md §3, DECISIONS.md 2026-09-01) blocks
+# them, rather than assuming either way.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  benign-command:
+    # The simplest possible proof the composite action invokes Cordon
+    # correctly end-to-end: no findings expected, step must succeed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          run: echo hello-from-sandboxed-command
+
+  setup-node-path-forwarding:
+    # The concrete scenario that motivated features/env-path-forwarding:
+    # actions/setup-node installs Node outside every directory Cordon
+    # bind-mounted before that feature (typically under
+    # /opt/hostedtoolcache), then prepends it to PATH. Before
+    # env-path-forwarding, `cordon run npm ...` could not resolve npm/node
+    # at all here — this job is the real-runner proof that it now does,
+    # not just the local WSL2 dev-machine proof in internal/sandbox's
+    # test suite.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: ./
+        with:
+          run: npm --version
+
+  high-finding-does-not-fail-the-step:
+    # Direct proof of features/github-action/intent.md's exit-code policy
+    # (INTENT.md §5: "Blocking installs by default. Cordon reports; the
+    # human decides."): a command that reads a credential-marker path
+    # (triggering behaviorreport's HIGH "Credential file read" rule) but
+    # exits 0 on its own must leave this job green. $HOME inside the
+    # sandbox is the project directory (DECISIONS.md 2026-09-01), so
+    # $HOME/.ssh/id_rsa resolves to a real, sandbox-writable path whose
+    # resolved form matches the credentialPathMarkers substring.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          run: >-
+            mkdir -p "$HOME/.ssh" &&
+            echo fake-key-for-selftest > "$HOME/.ssh/id_rsa" &&
+            cat "$HOME/.ssh/id_rsa" >/dev/null
+
+      - name: Verify the HIGH finding actually fired (not a vacuous pass)
+        shell: bash
+        run: |
+          if ! grep -q "Credential file read" "$GITHUB_STEP_SUMMARY"; then
+            echo "::error::expected a 'Credential file read' HIGH finding in the step summary, found none — this job passing would otherwise prove nothing about the exit-code policy"
+            exit 1
+          fi
+          echo "HIGH finding was reported above, and the previous step still succeeded — exit-code policy confirmed."

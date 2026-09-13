@@ -2434,3 +2434,103 @@ Cordon-reviewed set of six directories; it now depends on whatever the
 invoker's PATH contains. That's a deliberate, logged tradeoff — read-only
 and env-var-forwarding excluded on purpose — not a scope creep we didn't
 notice."
+
+---
+
+## [2026-09-13] github-action: build and run are separate composite steps; exit code always mirrors the wrapped command; no annotations yet
+
+**Context:** First real external-facing surface (INTENT.md §4 Phase 3).
+Two defaults needed deciding deliberately rather than by habit: what
+happens when Cordon itself fails to even start, and whether a finding
+should ever fail the CI step.
+
+**Compile failure vs. wrapped-command failure — distinguishability
+checked, not assumed:** the composite action was first drafted as a
+single `go run $GITHUB_ACTION_PATH/cmd/cordon run -- <command>` step.
+Asked directly whether a `go run` compile failure would be
+distinguishable, at a glance, from the wrapped command simply exiting
+non-zero — since both would otherwise fail the same step under the same
+step name. They would not have been: a `bash -eo pipefail` composite
+step reports one pass/fail per step, and `go run`'s own build failure
+and its target's exit code both surface as "this step failed," visible
+only by reading the log text. Split into two steps instead: "Build
+Cordon" (`go build -o "$RUNNER_TEMP/cordon-bin" ./cmd/cordon`, in
+`$GITHUB_ACTION_PATH`) and "Run wrapped command under Cordon" (executes
+the built binary). Verified directly, not assumed: appended a syntax
+error to `cmd/cordon/main.go`, ran `go build` against it, confirmed a
+real, isolated failure (`exit 1`, a real compiler error) with the
+wrapped-command step never reached, then restored the file before
+committing. A user scanning a job's step list now sees which one failed
+without opening logs — "my install failed" vs. "Cordon itself is
+broken" are two different step names, not two readings of one.
+
+**Exit code / fail policy — checked against INTENT.md §5's actual
+wording, not defaulted to "fail on HIGH" the way a security scanner
+normally would:** §5 states plainly, as a non-goal: "Blocking installs
+by default. Cordon reports; the human decides." `cmd/cordon`'s `run()`
+(`main.go`) already, unconditionally, returns `res.ExitCode` — the
+wrapped command's own exit status — regardless of what
+`behaviorreport.Generate` found; no code path today lets a finding
+change the process's exit code. The Action's "Run wrapped command under
+Cordon" step therefore captures the wrapped binary's exit status
+explicitly (`set +e` first — a composite step is otherwise `bash -e`,
+which would abort before the step-summary write the moment the wrapped
+command failed) and re-exits with exactly that value. No configurable
+"fail on HIGH" input was added. Considered and rejected for this slice:
+building one honestly requires `cmd/cordon` to expose a distinct,
+structured "there were HIGH findings" signal separate from
+`res.ExitCode` — none exists today, and faking one by grepping the
+Action's own plain-text report for `[HIGH]` would be exactly the
+fragile, text-format-coupled shortcut this project avoids elsewhere
+(see the annotations decision below). Named as a real, specific
+follow-up (a `--fail-on` flag or a machine-readable output mode in
+`cmd/cordon` itself), not silently dropped.
+
+**Findings surfacing — passthrough plus step summary, no annotations
+yet:** the behavior report is already written to stderr
+(DECISIONS.md 2026-09-05), so an unmodified `run:` step already places
+it in the job log in the same order a bare invocation would, with zero
+wrapper logic. Verified locally (not yet on a real runner — see the
+Done-checklist item still open in `features/github-action/intent.md`):
+`tee`ing stderr to a file for the step summary does not alter what
+reaches the log, in either the no-findings case or the HIGH-finding
+case. The same text is also appended to `$GITHUB_STEP_SUMMARY` as a
+fenced code block. GitHub Actions `::warning::`/`::error::` annotations
+were considered and deferred, not built: producing accurate ones means
+parsing `behaviorreport.WriteText`'s plain-text output for
+severity/title, which would couple the Action's correctness to a text
+format with no stability contract today (no struct/JSON export exists
+in `internal/behaviorreport`). Same shape of tradeoff as the fail-policy
+decision above — declining to build a feature on a scrape of another
+package's incidental string output, twice in the same slice, not a
+coincidence.
+
+**Consequences:**
+- Easy: a user gets accurate signal about *what* broke (Cordon vs. the
+  install) without reading a single log line, and the exit-code
+  contract that already existed in `cmd/cordon` needed zero changes to
+  extend correctly into CI.
+- Deferred, named explicitly: a configurable fail-on-severity gate, and
+  annotation-based surfacing — both blocked on the same missing
+  upstream piece (a structured signal from `cmd/cordon` beyond
+  `res.ExitCode` and a plain-text report), not on Action-side effort.
+- Unverified until CI actually runs `.github/workflows/action-selftest.yml`:
+  everything above was checked against the real built binary run
+  locally, on this WSL2 dev machine, which already has unprivileged
+  userns available — whether GitHub's hosted `ubuntu-latest` also does,
+  or the AppArmor gate (DECISIONS.md 2026-09-01) blocks it, is still an
+  open question this workflow exists to answer for real, not assume.
+
+**If asked to defend this:** "Splitting build and run into separate
+composite steps was checked, not assumed to be enough: I broke the
+build on purpose and confirmed the failure lands on a differently-named
+step than a wrapped-command failure would. The exit-code policy isn't
+'fail on HIGH like a normal scanner' — INTENT.md §5 says plainly that
+Cordon reports and the human decides, and `cmd/cordon` already never
+lets a finding change its exit code, so the Action just has to preserve
+that contract faithfully, which meant explicitly capturing and
+re-exiting the wrapped binary's own status under `set +e`. I declined to
+fake a 'fail on HIGH' option or real annotations by scraping Cordon's
+own plain-text report for keywords, because that couples a CI-facing
+feature to a format with zero stability guarantees — both are named as
+real follow-ups that belong in `cmd/cordon` itself, not the Action."
