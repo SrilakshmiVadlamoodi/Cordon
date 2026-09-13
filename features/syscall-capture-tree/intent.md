@@ -1,6 +1,7 @@
 # syscall-capture-tree
 
-**Inherits:** INTENT.md §3 Observation layer, §1 detection-is-best-effort;
+**Inherits:** INTENT.md §4 Phase 5 (Tree Tracing, deferred, revisit after
+Phase 4), §3 Observation layer, §1 detection-is-best-effort;
 [[syscall-capture]] (builds directly on its PID-1 init shim, its ptrace
 attach, and its seccomp-BPF filter — this slice widens who gets traced,
 it doesn't change how)
@@ -9,9 +10,10 @@ it doesn't change how)
 spawns `node-gyp`, which spawns `cc`/`make`. A capture scoped to only the
 single directly-launched child (the deliberate boundary [[syscall-capture]]
 shipped with) sees none of a native build's actual syscalls, which is most
-of what an install with real side effects does. Not scheduled to a roadmap
-phase yet — split out of `syscall-capture` (DECISIONS.md 2026-09-04) as a
-named decision rather than built past what that slice's intent asked for.
+of what an install with real side effects does. Scoped into INTENT.md
+Phase 5 ("Tree Tracing", deferred, revisit after Phase 4) — split out of
+`syscall-capture` (DECISIONS.md 2026-09-04) as a named decision rather
+than built past what that slice's intent asked for.
 
 **Done:**
 - [ ] Events captured and reported from every auto-attached descendant,

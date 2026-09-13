@@ -160,7 +160,8 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
       that doc
 - [ ] `syscall-capture-tree` — widen tracing to the full process tree
       (fork/clone/exec auto-attach); deferred out of `syscall-capture`,
-      not yet phase-scheduled — see `features/syscall-capture-tree/intent.md`
+      scoped into Phase 5 (deferred, revisit after Phase 4) — see
+      `features/syscall-capture-tree/intent.md`
 - [x] `behavior-report` — plain-text diagnosis (to stderr; two crude
       rules — credential-read / network-egress; see that feature's
       intent.md for deviations)
@@ -204,6 +205,26 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
 - [ ] pip / `setup.py` support
 - [ ] Cross-version behavioral baselines ("this version started doing X")
 - [ ] Evaluate eBPF (Aya, or Go equivalents) to replace ptrace
+
+### Phase 5 — Tree Tracing (deferred, revisit after Phase 4)
+
+This phase is explicitly lower priority than Phase 3 (distribution) and
+Phase 4 (reach) by deliberate decision — the tool's current single-process
+scope is honestly documented as a known limitation (see
+`features/syscall-capture-tree/intent.md`, DECISIONS.md, and the
+credential-read-gap fixture), not silently downplayed, and closing it is
+being weighed against the resume/adoption value of shipping distribution
+work first. Revisit after Phase 4 to decide whether to build it at all.
+
+- [ ] Auto-attach `PTRACE_O_TRACEFORK`/`TRACEVFORK`/`TRACECLONE`/`TRACEEXEC`
+      for real forked child processes (not just sibling OS threads,
+      already covered by `syscall-capture`)
+- [ ] Extend the tracee-set/dispatch logic from single-process to a full
+      process tree
+- [ ] `credential-read-gap` and `delayed-process` corpus fixtures flip
+      from documented misses to regression-tested catches
+- [ ] Re-measure overhead — tree tracing multiplies ptrace stops across
+      every traced process, not just one
 
 ---
 
