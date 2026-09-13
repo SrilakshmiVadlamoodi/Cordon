@@ -270,6 +270,120 @@ func TestRun_ProjectDirWritableAndHomeInvisible(t *testing.T) {
 	}
 }
 
+// pathForwardToolDir creates a directory holding one executable script, in a
+// location that is (a) outside roSystemDirs and defaultPath, so it exercises
+// the actual gap, and (b) NOT under /tmp — the sandbox mounts a fresh, empty
+// tmpfs over /tmp (setupRootfs step 6) *after* the PATH-forwarding binds
+// (step 3), so anything nested under /tmp would be shadowed by that later
+// mount and this test would pass or fail for the wrong reason. /var/tmp is a
+// distinct top-level directory the /tmp tmpfs mount never touches.
+func pathForwardToolDir(t *testing.T, name, script string) string {
+	t.Helper()
+	const base = "/var/tmp"
+	if _, err := os.Stat(base); err != nil {
+		t.Skipf("no %s on this host: %v", base, err)
+	}
+	dir, err := os.MkdirTemp(base, "cordon-path-forward-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestRun_ForwardsCallerPathDirectoryOutsideSystemDirs is the direct proof
+// for features/env-path-forwarding/intent.md's first Done item: a binary
+// outside today's fixed roSystemDirs set, but on the caller's own PATH,
+// resolves and runs inside the sandbox. Before this feature, Command[0]
+// resolution (runChild's exec.LookPath against the sandbox PATH) could never
+// find this binary at all — TestRun_CommandNotFoundExitsWith127 is the
+// pre-existing proof of that failure mode for an unresolvable command.
+func TestRun_ForwardsCallerPathDirectoryOutsideSystemDirs(t *testing.T) {
+	requireUserNS(t)
+
+	toolDir := pathForwardToolDir(t, "cordon-path-forward-probe", "#!/bin/sh\necho FORWARDED_TOOL_RAN\n")
+	t.Setenv("PATH", toolDir+":"+os.Getenv("PATH"))
+
+	var out bytes.Buffer
+	res, err := sandbox.Run(sandbox.Spec{
+		Command:    []string{"cordon-path-forward-probe"},
+		ProjectDir: t.TempDir(),
+		Stdout:     &out,
+	})
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit %d, output:\n%s", res.ExitCode, out.String())
+	}
+	if !strings.Contains(out.String(), "FORWARDED_TOOL_RAN") {
+		t.Fatalf("tool from forwarded PATH directory did not run; output:\n%s", out.String())
+	}
+}
+
+// TestRun_ForkedChildResolvesToolFromForwardedPath is the setup-node-shaped
+// scenario from features/env-path-forwarding/intent.md: not the top-level
+// wrapped command itself, but a process *it forks* (the way `npm` forks
+// `node`, or a postinstall script invokes `node` by bare name) resolving a
+// tool via a PATH entry outside every directory Cordon bind-mounted before
+// this feature — the actions/setup-node case that motivated it, where node
+// lives under a CI tool-cache path outside /usr entirely.
+func TestRun_ForkedChildResolvesToolFromForwardedPath(t *testing.T) {
+	requireUserNS(t)
+
+	toolDir := pathForwardToolDir(t, "node", "#!/bin/sh\necho NODE_RAN\n")
+	t.Setenv("PATH", toolDir+":"+os.Getenv("PATH"))
+
+	var out bytes.Buffer
+	res, err := sandbox.Run(sandbox.Spec{
+		// The wrapped command is /bin/sh (resolved via roSystemDirs,
+		// unaffected by this feature); it, in turn, resolves "node" by bare
+		// name against its own inherited PATH (childEnv's Envp) — the same
+		// resolution shape a forked lifecycle script uses.
+		Command:    []string{"/bin/sh", "-c", "node"},
+		ProjectDir: t.TempDir(),
+		Stdout:     &out,
+	})
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit %d, output:\n%s", res.ExitCode, out.String())
+	}
+	if !strings.Contains(out.String(), "NODE_RAN") {
+		t.Fatalf("forked child did not resolve tool via forwarded PATH; output:\n%s", out.String())
+	}
+}
+
+// TestRun_DefaultPathResolutionUnaffected is the no-regression proof: with
+// the caller's PATH left at whatever this test process already has (no
+// unusual entries deliberately added), resolving a command by bare name
+// against the sandbox's baseline PATH still works exactly as before this
+// feature — additive forwarding must never shrink or reorder the existing
+// resolvable set.
+func TestRun_DefaultPathResolutionUnaffected(t *testing.T) {
+	requireUserNS(t)
+
+	var out bytes.Buffer
+	res, err := sandbox.Run(sandbox.Spec{
+		Command:    []string{"sh", "-c", "echo BASELINE_OK"},
+		ProjectDir: t.TempDir(),
+		Stdout:     &out,
+	})
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit %d, output:\n%s", res.ExitCode, out.String())
+	}
+	if !strings.Contains(out.String(), "BASELINE_OK") {
+		t.Fatalf("baseline bare-name PATH resolution regressed; output:\n%s", out.String())
+	}
+}
+
 func TestRun_TmpIsWritableAndEphemeral(t *testing.T) {
 	requireUserNS(t)
 

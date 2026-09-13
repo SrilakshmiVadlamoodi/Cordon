@@ -27,9 +27,12 @@ type Spec struct {
 	Stderr io.Writer
 }
 
-// Note: the wrapped command's environment is not caller-controllable yet.
-// Run synthesizes a minimal sanitized environment (see childEnv in
-// run_linux.go). A deliberate forwarding policy is a later concern.
+// Note: the wrapped command's environment is still not caller-controllable
+// in general. Run synthesizes a minimal sanitized environment (see childEnv
+// in run_linux.go). The one deliberate exception is PATH: directories on
+// the caller's own PATH are bind-mounted read-only and forwarded (see
+// features/env-path-forwarding/intent.md) — everything else (HOME, PWD, and
+// arbitrary env vars generally) is still not forwarded, on purpose.
 
 // Result is the outcome of a sandboxed execution. It is only meaningful
 // when [Run] returns a nil error.
