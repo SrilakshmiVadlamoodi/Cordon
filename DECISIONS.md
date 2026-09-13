@@ -2534,3 +2534,83 @@ fake a 'fail on HIGH' option or real annotations by scraping Cordon's
 own plain-text report for keywords, because that couples a CI-facing
 feature to a format with zero stability guarantees — both are named as
 real follow-ups that belong in `cmd/cordon` itself, not the Action."
+
+---
+
+## [2026-09-13] Pre-push check: the unprivileged-userns t.Skip only covers `go test`, not a real `cordon run` — production path had no equivalent
+
+**Context:** Before pushing `github-action` to actually exercise
+`action-selftest.yml` on GitHub's hosted `ubuntu-latest` runner — the
+first real test of whether unprivileged user namespaces are available
+there, or the AppArmor gate blocks them (INTENT.md §3, DECISIONS.md
+2026-09-01) — checked whether a restricted runner would fail legibly
+or confusingly.
+
+**What was checked:** `internal/sandbox/helpers_test.go`'s `requireUserNS`
+(the two sysctl probes, `unprivileged_userns_clone` and
+`apparmor_restrict_unprivileged_userns`) is not bit-rotted — both paths
+and both comparison values still match DECISIONS.md 2026-09-01 exactly.
+But that function only runs under `go test`, and `action-selftest.yml`
+never runs `go test` — it builds and runs the real `cordon` binary via
+the composite action. On a restricted runner, `sandbox.Run`'s existing
+`cmd.Start()` failure path (`run_linux.go`, "starting sandbox child")
+would have surfaced whatever raw OS error `clone()` returns (e.g.
+`operation not permitted`) — attributable to the right *step* ("Run
+wrapped command under Cordon"), but not to the right *cause*: nothing in
+that message would tell a reader this is the specific, documented,
+known host-policy gate rather than some other permissions problem in
+Cordon itself.
+
+**Chose:** Added `checkUserNamespacesAvailable` (`run_linux.go`) — the
+production-path equivalent of `requireUserNS` — called at the top of
+`Run`, before any namespace or child-process setup, returning a
+specific, named error ("unprivileged user namespaces are disabled on
+this host (kernel.unprivileged_userns_clone=0) -- see INTENT.md §3
+Platform", and the AppArmor equivalent) for exactly the two documented
+gates. Both the production check and the test's `requireUserNS` now
+read from the same two package-level path vars
+(`unprivilegedUserNSClonePath`, `apparmorRestrictUnprivilegedUserNSPath`)
+instead of two independently hand-copied literal strings — the second
+copy is exactly how this kind of check silently drifts out of sync with
+its own test in the first place. `requireUserNS` itself now just calls
+`checkUserNamespacesAvailable` through a `CheckUserNamespacesAvailableForTest`
+export-test shim, so there is one implementation, not two.
+
+**Deliberately not exhaustive:** only the two named, documented gates are
+checked. A `clone()` failure from any other cause (a namespace-count
+ulimit, an unrelated LSM policy neither of us has hit yet) still falls
+through to the existing generic "starting sandbox child" error,
+unattributed exactly as before — this closes the two specific cases
+INTENT.md already commits to explaining, not every conceivable clone()
+failure.
+
+**Verified, not just argued:** `TestCheckUserNamespacesAvailable`
+(`usernscheck_linux_test.go`) exercises all five cases directly via the
+injectable path vars pointed at real temp files — both restricted
+branches, both matching-but-unrestricted values (`1` for the clone
+sysctl, `0` for the AppArmor one — the "looks similar but means the
+opposite" case a careless read of either check could get backwards),
+and the missing-file case (an unpatched kernel with neither sysctl at
+all). All five pass. Full suite (`go test ./...`) re-run clean after
+the `requireUserNS` refactor.
+
+**Consequences:**
+- If `ubuntu-latest` does turn out to gate unprivileged userns, the
+  push about to happen will fail with a message that names the exact
+  sysctl and value, not a bare OS errno string — legible without
+  needing to already know INTENT.md §3's platform caveats by heart.
+- This was caught and fixed *before* the first real run, specifically
+  because it was asked for directly rather than trusted from "the test
+  suite already handles this" — the test suite handling it and the
+  production binary handling it are two different claims, and only one
+  of them was true until now.
+
+**If asked to defend this:** "I was asked to confirm a restricted host
+would fail with the documented t.Skip message, not something confusing
+downstream. It wouldn't have — the skip only exists for `go test`, and
+the GitHub Action runs the real binary, which had no equivalent check
+at all. I added one, sharing the same two sysctl paths as the test's
+own check so they can't drift apart again, and wrote a real test that
+exercises all five value combinations — including the two 'looks
+restrictive but actually isn't' cases — rather than trusting the
+error-string reasoning alone."
