@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/SrilakshmiVadlamoodi/cordon/internal/behaviorreport"
@@ -52,6 +53,62 @@ type childConfig struct {
 	Command    []string
 	ProjectDir string
 	NewRoot    string // empty mountpoint dir on the host; the child mounts a tmpfs here
+
+	// ExtraPathDirs are directories from the caller's own PATH, captured
+	// here in Run before any namespace or tracee exists (see
+	// features/env-path-forwarding/intent.md's TOCTOU note), that are not
+	// already covered by roSystemDirs or defaultPath. They get bind-mounted
+	// read-only into the sandbox and appended to the wrapped command's PATH,
+	// so a tool the caller resolves outside the fixed system directories
+	// (e.g. a CI-installed Node under a tool-cache path) still resolves
+	// inside the sandbox.
+	ExtraPathDirs []string
+}
+
+// extraPathDirs computes the subset of callerPath's directories that need
+// forwarding: present, not already bind-mounted via roSystemDirs, and not
+// already on defaultPath. Order-preserving and deduplicated so the result is
+// stable and minimal. Pure function of its input — no filesystem access —
+// so the caller-influence-timing argument in intent.md holds regardless of
+// what exists on disk when this runs.
+func extraPathDirs(callerPath string) []string {
+	covered := make(map[string]bool)
+	for _, d := range roSystemDirs {
+		covered[filepath.Clean(d)] = true
+	}
+	for _, d := range strings.Split(defaultPath, ":") {
+		if d != "" {
+			covered[filepath.Clean(d)] = true
+		}
+	}
+
+	var extra []string
+	for _, d := range strings.Split(callerPath, ":") {
+		if d == "" {
+			continue
+		}
+		d = filepath.Clean(d)
+		if covered[d] || underAny(d, roSystemDirs) {
+			continue
+		}
+		covered[d] = true // dedupe repeats within callerPath itself
+		extra = append(extra, d)
+	}
+	return extra
+}
+
+// underAny reports whether dir is exactly, or nested under, any of roots.
+// Used so a caller PATH entry like /usr/local/bin isn't redundantly
+// bind-mounted on its own when /usr's existing recursive bind already covers
+// it.
+func underAny(dir string, roots []string) bool {
+	for _, r := range roots {
+		r = filepath.Clean(r)
+		if dir == r || strings.HasPrefix(dir, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // Run executes spec.Command inside a fresh set of Linux namespaces with an
@@ -77,10 +134,18 @@ func Run(spec Spec) (Result, error) {
 	}
 	defer os.RemoveAll(newRoot)
 
+	// Captured here, in the host-side parent, before childConfig is even
+	// marshaled — strictly before any namespace, re-exec'd child, or
+	// tracee exists. See features/env-path-forwarding/intent.md: the
+	// wrapped command cannot influence this value, because nothing of the
+	// sandbox's process tree exists yet when this read happens.
+	extraDirs := extraPathDirs(os.Getenv("PATH"))
+
 	blob, err := json.Marshal(childConfig{
-		Command:    spec.Command,
-		ProjectDir: projectDir,
-		NewRoot:    newRoot,
+		Command:       spec.Command,
+		ProjectDir:    projectDir,
+		NewRoot:       newRoot,
+		ExtraPathDirs: extraDirs,
 	})
 	if err != nil {
 		return Result{}, fmt.Errorf("sandbox.Run: encoding child config: %w", err)
@@ -235,8 +300,12 @@ func runChild(cfg childConfig) {
 		os.Exit(125)
 	}
 
-	// Resolve the command against the sandbox PATH, not the parent's.
-	os.Setenv("PATH", defaultPath)
+	// Resolve the command against the sandbox PATH, not the parent's. Must
+	// include the same extra directories childEnv hands the wrapped
+	// command below (env-path-forwarding) — otherwise a command that only
+	// resolves via a forwarded PATH entry (e.g. a CI-installed node) would
+	// fail to resolve here before ever reaching syscallcapture.Run.
+	os.Setenv("PATH", sandboxPath(cfg))
 	argv0, err := exec.LookPath(cfg.Command[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cordon child: %v\n", err)
@@ -317,12 +386,15 @@ func setupRootfs(cfg childConfig) error {
 		return fmt.Errorf("tmpfs on new root: %w", err)
 	}
 
-	// 3. Read-only binds of the host system directories. The RO flag is
-	//    silently ignored on the initial bind and only takes effect on a
-	//    follow-up MS_REMOUNT|MS_BIND (a documented kernel quirk).
-	for _, dir := range roSystemDirs {
+	// 3. Read-only binds of the host system directories, plus (see
+	//    features/env-path-forwarding/intent.md) any extra directories from
+	//    the caller's own PATH that aren't already covered by the set
+	//    below. The RO flag is silently ignored on the initial bind and
+	//    only takes effect on a follow-up MS_REMOUNT|MS_BIND (a documented
+	//    kernel quirk).
+	for _, dir := range append(append([]string{}, roSystemDirs...), cfg.ExtraPathDirs...) {
 		if _, err := os.Lstat(dir); err != nil {
-			continue // e.g. no /lib64 on arm64
+			continue // e.g. no /lib64 on arm64, or a stale caller PATH entry
 		}
 		target := filepath.Join(cfg.NewRoot, dir)
 		if err := os.MkdirAll(target, 0o755); err != nil {
@@ -432,12 +504,26 @@ func setupRootfs(cfg childConfig) error {
 	return nil
 }
 
+// sandboxPath is defaultPath plus whatever extra directories
+// env-path-forwarding bind-mounted from the caller's own PATH
+// (features/env-path-forwarding/intent.md) — additive, never a
+// replacement, so the existing baseline resolvable set never shrinks. Used
+// both to resolve cfg.Command[0] in runChild and as childEnv's PATH, so the
+// wrapped command's own view of PATH matches what it was actually resolved
+// against.
+func sandboxPath(cfg childConfig) string {
+	if len(cfg.ExtraPathDirs) == 0 {
+		return defaultPath
+	}
+	return defaultPath + ":" + strings.Join(cfg.ExtraPathDirs, ":")
+}
+
 // childEnv is the sanitized environment for the wrapped command. HOME points
 // at the project directory: the real home is not mounted, and npm needs a
 // writable HOME for its cache and .npmrc.
 func childEnv(cfg childConfig) []string {
 	env := []string{
-		"PATH=" + defaultPath,
+		"PATH=" + sandboxPath(cfg),
 		"HOME=" + cfg.ProjectDir,
 		"PWD=" + cfg.ProjectDir,
 	}
