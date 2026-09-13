@@ -1,0 +1,77 @@
+name: 'Cordon'
+description: >-
+  Run a command (npm install and friends) inside Cordon's rootless Linux
+  sandbox and report what it actually did. Never fails the step on a
+  finding by itself — Cordon reports, the human decides (INTENT.md §5).
+author: 'Srilakshmi Vadlamoodi'
+
+inputs:
+  run:
+    description: >-
+      The shell command to run under Cordon (e.g. "npm ci"). Executed as
+      `sh -c '<run>'` inside the sandbox, with the sandbox's own PATH and
+      the caller's PATH directories forwarded read-only
+      (features/env-path-forwarding).
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check platform
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" != "Linux" ]; then
+          echo "::error::Cordon only supports Linux runners (INTENT.md §3: namespaces and seccomp are Linux-only, permanently). runner.os=${{ runner.os }}"
+          exit 1
+        fi
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+
+    - name: Build Cordon
+      # A separate, distinctly-named step from the one that runs the
+      # wrapped command below: if this step fails (a bad pin, a toolchain
+      # problem, a build error in Cordon itself), it fails as "Build
+      # Cordon" in the workflow's job view, not as the wrapped command's
+      # own step — a user must be able to tell "my install failed" from
+      # "Cordon itself is broken" at a glance, without reading logs.
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: go build -o "${{ runner.temp }}/cordon-bin" ./cmd/cordon
+
+    - name: Run wrapped command under Cordon
+      shell: bash
+      env:
+        # Passed via env, not interpolated directly into the script body,
+        # so a command containing quotes or shell metacharacters can't
+        # break out of the script's own syntax.
+        CORDON_RUN_CMD: ${{ inputs.run }}
+        CORDON_BIN: ${{ runner.temp }}/cordon-bin
+        CORDON_REPORT_FILE: ${{ runner.temp }}/cordon-report.txt
+      run: |
+        # set +e: a composite run step otherwise aborts immediately (bash
+        # -eo pipefail) the moment cordon-bin exits non-zero, which would
+        # skip the step-summary write below whenever the wrapped command
+        # itself fails — exactly the case where seeing the report matters
+        # most.
+        set +e
+        "$CORDON_BIN" run sh -c "$CORDON_RUN_CMD" 2> >(tee "$CORDON_REPORT_FILE" >&2)
+        status=$?
+
+        if [ -s "$CORDON_REPORT_FILE" ]; then
+          {
+            echo '## Cordon behavior report'
+            echo
+            echo '```'
+            cat "$CORDON_REPORT_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        # The Action's own exit code is exactly the wrapped command's exit
+        # code — INTENT.md §5: "Blocking installs by default. Cordon
+        # reports; the human decides." A HIGH finding never fails this
+        # step by itself (features/github-action/intent.md).
+        exit $status
