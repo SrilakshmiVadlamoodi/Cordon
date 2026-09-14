@@ -129,6 +129,16 @@ jobs:
             echo fake-key-for-selftest > "$HOME/.ssh/id_rsa" &&
             cat "$HOME/.ssh/id_rsa" >/dev/null
 
+      - name: DEBUG - dump GITHUB_STEP_SUMMARY path and content
+        shell: bash
+        run: |
+          echo "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY"
+          echo "--- exists? ---"
+          ls -la "$GITHUB_STEP_SUMMARY" 2>&1 || echo "MISSING"
+          echo "--- content ---"
+          cat "$GITHUB_STEP_SUMMARY" 2>&1 || echo "CAT FAILED"
+          echo "--- end content ---"
+
       - name: Verify the HIGH finding actually fired (not a vacuous pass)
         shell: bash
         run: |
