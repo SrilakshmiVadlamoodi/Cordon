@@ -96,7 +96,10 @@ runs:
         status=$?
         cat "$CORDON_REPORT_FILE" >&2
 
+        echo "DEBUG cordon-action: GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" >&2
+        echo "DEBUG cordon-action: CORDON_REPORT_FILE size=$(wc -c < "$CORDON_REPORT_FILE" 2>&1)" >&2
         if [ -s "$CORDON_REPORT_FILE" ]; then
+          echo "DEBUG cordon-action: entering summary-write branch" >&2
           {
             echo '## Cordon behavior report'
             echo
@@ -104,6 +107,9 @@ runs:
             cat "$CORDON_REPORT_FILE"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "DEBUG cordon-action: after write, summary size=$(wc -c < "$GITHUB_STEP_SUMMARY" 2>&1)" >&2
+        else
+          echo "DEBUG cordon-action: skipped summary-write branch, report file was empty" >&2
         fi
 
         # The Action's own exit code is exactly the wrapped command's exit
