@@ -81,9 +81,20 @@ runs:
         # skip the step-summary write below whenever the wrapped command
         # itself fails — exactly the case where seeing the report matters
         # most.
+        #
+        # stderr goes straight to the report file, not through a
+        # `2> >(tee ...)` process substitution: bash does not wait for a
+        # process-substitution subshell before continuing to the next
+        # line, so the `[ -s "$CORDON_REPORT_FILE" ]` check below could
+        # run before tee had finished flushing, silently skipping the
+        # step-summary write on a fast run (DECISIONS.md 2026-09-14, the
+        # race entry). A plain redirect is synchronous, so the file is
+        # complete before this line returns; `cat` afterward puts the
+        # same content back on stderr for the live log.
         set +e
-        "$CORDON_BIN" run sh -c "$CORDON_RUN_CMD" 2> >(tee "$CORDON_REPORT_FILE" >&2)
+        "$CORDON_BIN" run sh -c "$CORDON_RUN_CMD" 2>"$CORDON_REPORT_FILE"
         status=$?
+        cat "$CORDON_REPORT_FILE" >&2
 
         if [ -s "$CORDON_REPORT_FILE" ]; then
           {
