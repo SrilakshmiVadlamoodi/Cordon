@@ -25,6 +25,31 @@ runs:
           exit 1
         fi
 
+    - name: Lift AppArmor unprivileged-userns restriction (best-effort)
+      # Ubuntu 24.04+ (the ubuntu-latest default as of DECISIONS.md
+      # 2026-09-14) sets kernel.apparmor_restrict_unprivileged_userns=1,
+      # which blocks the unprivileged user namespace Cordon's rootless
+      # sandbox requires — confirmed on a real hosted runner, not assumed
+      # (same entry). This step tries a passwordless-sudo lift, scoped to
+      # this one ephemeral job VM. It is deliberately best-effort: if the
+      # sysctl is already permissive, or sudo isn't available (e.g. a
+      # self-hosted runner without it), this step exits 0 either way and
+      # changes nothing — checkUserNamespacesAvailable (run_linux.go)
+      # still catches an unlifted restriction below and fails the wrapped
+      # step with its own clear, specific error. This step never masks
+      # that error with a sudo failure of its own.
+      shell: bash
+      run: |
+        path=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if [ ! -f "$path" ] || [ "$(cat "$path")" != "1" ]; then
+          exit 0
+        fi
+        if sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null 2>&1; then
+          echo "::notice title=Cordon: lifted AppArmor unprivileged-userns restriction::This runner had kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu 24.04's hardened default), which blocks the unprivileged user namespace Cordon's rootless sandbox needs to run at all (INTENT.md §3 Platform; DECISIONS.md 2026-09-14). Cordon used passwordless sudo to set it to 0. Scope: this is a kernel setting on THIS JOB'S ephemeral runner VM only — it does not persist past this job, does not affect any other job, workflow, or runner, and makes no change to your repository, account, or self-hosted infrastructure beyond this one throwaway machine."
+        else
+          echo "::notice title=Cordon: could not lift AppArmor unprivileged-userns restriction::kernel.apparmor_restrict_unprivileged_userns=1 on this runner and passwordless sudo for the sysctl write was unavailable or refused, so Cordon left it as found. If the step below fails with 'unprivileged user namespaces are restricted by AppArmor', that is the expected, documented failure (INTENT.md §3 Platform; DECISIONS.md 2026-09-14) — not a bug in Cordon."
+        fi
+
     - name: Set up Go
       uses: actions/setup-go@v5
       with:

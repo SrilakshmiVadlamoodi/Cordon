@@ -14,35 +14,72 @@ on:
   workflow_dispatch:
 
 jobs:
-  probe-apparmor-lift:
-    # TEMPORARY diagnostic job, not a permanent part of this workflow —
-    # added to concretely test (not assume) whether ubuntu-latest's
-    # default `actions` user has passwordless sudo for the specific
-    # apparmor_restrict_unprivileged_userns sysctl, and whether a lift
-    # in one step persists into a later step of the same job (DECISIONS.md
-    # 2026-09-14 AppArmor-gate entry). Remove or replace once the
-    # sysctl-lift question is answered either way.
+  simulate-no-sudo-fallthrough:
+    # Proves the best-effort AppArmor lift in action.yml degrades safely
+    # when sudo is unavailable (e.g. a self-hosted runner without it):
+    # the wrapped-command failure must still be
+    # checkUserNamespacesAvailable's original legible error, not a sudo
+    # permission error masking it (DECISIONS.md 2026-09-14 AppArmor
+    # entries). Shadows the real `sudo` with one that always fails,
+    # ahead of it on PATH, rather than assuming the fallthrough is clean.
     runs-on: ubuntu-latest
     steps:
-      - name: Show current value and sudo -n check
+      - uses: actions/checkout@v4
+
+      - name: Shadow sudo with a command that always fails, ahead of the real one on PATH
+        shell: bash
         run: |
-          echo "current value: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
-          echo "--- sudo -n -l for this exact sysctl command ---"
-          sudo -n /sbin/sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 && echo "SUDO_NONINTERACTIVE_OK" || echo "SUDO_NONINTERACTIVE_FAILED"
-      - name: Confirm value after the lift attempt, same step's own shell
+          mkdir -p "$RUNNER_TEMP/fake-bin"
+          cat > "$RUNNER_TEMP/fake-bin/sudo" <<'EOF'
+          #!/bin/sh
+          exit 1
+          EOF
+          chmod +x "$RUNNER_TEMP/fake-bin/sudo"
+          echo "$RUNNER_TEMP/fake-bin" >> "$GITHUB_PATH"
+
+      - name: Confirm the fake sudo actually shadows the real one
+        shell: bash
         run: |
-          echo "value immediately after: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
-      - name: Confirm the lift persists into a later, separate step
-        run: |
-          echo "value in a later step: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
-          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = "0" ]; then
-            echo "PERSISTS_ACROSS_STEPS=true"
-          else
-            echo "PERSISTS_ACROSS_STEPS=false"
+          if sudo -n true 2>/dev/null; then
+            echo "::error::fake sudo shadow did not take effect — this test would prove nothing"
+            exit 1
           fi
-      - name: Try actually cloning a user namespace now, as an unprivileged check
+          echo "fake sudo confirmed in effect: $(command -v sudo)"
+
+      - name: Run Cordon with sudo unavailable
+        id: cordon_no_sudo
+        continue-on-error: true
+        uses: ./
+        with:
+          run: echo should-not-run-if-userns-still-blocked
+
+      - name: Verify the original legible AppArmor error surfaced, not a sudo error
+        shell: bash
         run: |
-          unshare --user --map-root-user echo "USERNS_CLONE_NOW_WORKS" || echo "USERNS_CLONE_STILL_FAILS"
+          if [ "${{ steps.cordon_no_sudo.outcome }}" != "failure" ]; then
+            echo "::error::expected the wrapped step to fail (userns should still be blocked with sudo faked out) but it reported outcome=${{ steps.cordon_no_sudo.outcome }} — this test proves nothing if it didn't actually fail"
+            exit 1
+          fi
+
+          report="$RUNNER_TEMP/cordon-report.txt"
+          if [ ! -s "$report" ]; then
+            echo "::error::expected a Cordon report file containing the AppArmor error, found none at $report"
+            exit 1
+          fi
+
+          if ! grep -q "unprivileged user namespaces are restricted by AppArmor" "$report"; then
+            echo "::error::expected checkUserNamespacesAvailable's exact error text, got:"
+            cat "$report"
+            exit 1
+          fi
+
+          if grep -qi "sudo" "$report"; then
+            echo "::error::the surfaced error mentions sudo — the original legible error is being masked by a sudo-related failure instead of falling through cleanly"
+            cat "$report"
+            exit 1
+          fi
+
+          echo "Confirmed: with sudo unavailable, Cordon still failed with its original legible AppArmor error, not a sudo error."
 
   benign-command:
     # The simplest possible proof the composite action invokes Cordon

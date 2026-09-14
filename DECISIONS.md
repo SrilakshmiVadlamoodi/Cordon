@@ -2712,3 +2712,158 @@ confusing — but the underlying blocker is real and needs an explicit
 fix before Phase 3's 'three lines' promise is true on stock CI."
 
 ---
+
+## [2026-09-14] AppArmor userns gate: fix chosen — best-effort sysctl lift inside action.yml, loud and non-fatal, not a required prerequisite step
+
+**Context:** Direct follow-on to the entry above. Three options were on
+the table for the confirmed `ubuntu-latest` AppArmor block: lift the
+restriction from inside `action.yml` itself, document a required
+prerequisite step in every consuming workflow, or accept the limitation
+and restrict Cordon's GitHub Action to self-hosted/pre-hardened runners
+only. Before choosing, ran a dedicated probe job
+(`probe-apparmor-lift`, since removed — its findings are recorded here,
+not left live as a standing job) to test the lift concretely rather than
+assume it would work:
+- `sudo -n /sbin/sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+  succeeded non-interactively as the default `actions` runner user —
+  confirmed, not assumed, that passwordless sudo covers this specific
+  write.
+- The lifted value (`0`) was still in effect in a later, separate step
+  of the same job — confirmed the runner-level sysctl persists for the
+  job's own remaining steps, as expected of a per-VM kernel setting.
+- `unshare --user --map-root-user` succeeded after the lift, confirming
+  it unblocks actual userns creation, not just the sysctl read-back.
+
+**Options considered:**
+- **Required prerequisite step**, documented for every consuming
+  workflow to add before `uses: ./`. Most honest about what's
+  happening — nothing hidden inside the action. Rejected: it
+  permanently breaks INTENT.md §4 Phase 3's stated distribution goal
+  ("GitHub Action wrapper (three lines in a workflow file)") for every
+  single user, over an Ubuntu-version-specific AppArmor default that is
+  an implementation detail of *our* rootless architecture, not
+  something a caller should need to already know about to use Cordon at
+  all.
+- **Restrict to self-hosted/pre-hardened runners only**, document the
+  gap, no code change. Simplest, but concedes the actual target
+  audience (anyone with a stock `ubuntu-latest` workflow) up front,
+  which is most of Phase 3's intended users.
+- **Best-effort lift inside `action.yml`, loud, falling through to the
+  existing error on failure.** (Chosen; see below.)
+
+**Chose:** A new `action.yml` step, "Lift AppArmor unprivileged-userns
+restriction (best-effort)", runs immediately after the existing "Check
+platform" step and before Go is set up or Cordon is built. It: reads
+`/proc/sys/kernel/apparmor_restrict_unprivileged_userns` directly (no
+dependency on `sysctl` existing for the *read*, only for the *write*);
+exits 0 immediately if the file is absent or already not `1` (nothing
+to do — most hosts, including any pre-5.10-hardened distro or a runner
+where this was already fixed upstream, hit this path and the step is a
+no-op); otherwise attempts
+`sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+On success, emits `::notice::` naming exactly what changed, why, and
+its scope. On failure (`sudo` missing, not passwordless, or refused),
+emits a different `::notice::` saying so and naming the specific
+downstream error to expect — then the step still exits 0. Either way,
+`checkUserNamespacesAvailable` (`run_linux.go`, the entry two above
+this one) runs unchanged, later, inside the built binary — this step
+never touches or short-circuits it, only tries to make its check
+unnecessary.
+
+**Why "best-effort, falls through" instead of a hard requirement:** the
+whole point of `checkUserNamespacesAvailable` existing is that Cordon
+must never fail confusingly when a namespace can't be created — it
+fails with a specific, named reason. A lift step that *required*
+success (erroring out if `sudo -n` failed) would reintroduce exactly
+the failure mode that check was built to prevent, just one layer
+earlier and over a different cause: on a self-hosted runner without
+passwordless sudo, a hard-required lift step would abort with a sudo
+permission error that has nothing to do with the real, already-legible
+diagnosis the binary itself is fully capable of producing on its own.
+Best-effort means the lift step can only ever *help* (turn a would-be
+failure into a pass) or be a no-op (leave the existing, already-correct
+failure path exactly as before) — it has no code path that makes
+things worse than not having it at all.
+
+**Why this doesn't compromise the "no sudo" rootless ground rule:**
+CLAUDE.md and INTENT.md's "rootless: no sudo, no setuid helper" rule
+governs how the *wrapped command* gets confined — the sandboxed child
+process itself must never require or receive elevated privilege to run
+under Cordon, and nothing about this step touches that: the wrapped
+command still runs in exactly the same unprivileged user namespace as
+before, with the same single UID mapping (DECISIONS.md 2026-09-01), and
+`sandbox.Run`'s own code path calls no `sudo` and gained none. What
+this step uses `sudo` for is CI *infrastructure* setup — adjusting a
+host kernel toggle on the runner VM itself, before Cordon's binary is
+even built — which is a different layer entirely: the same distinction
+as a Dockerfile's build stage running as root to install packages while
+the resulting container runs unprivileged. A GitHub-hosted runner
+already grants its default user passwordless sudo for general system
+administration (that is what made the lift possible at all); using a
+sliver of that pre-existing CI-infrastructure privilege to unblock our
+own sandbox's prerequisite is not the same claim as "Cordon's sandbox
+needs privilege to confine a process," which remains false.
+
+**Why this degrades safely, concretely:** three failure modes were
+worth naming and each was checked or reasoned through, not assumed:
+1. *Sysctl already permissive* (older kernel, different distro, a
+   runner image that fixes this upstream later) — the `!= "1"` check
+   makes the step a silent no-op; no `sudo` call is even attempted.
+2. *No `sudo` at all, or not passwordless, on a self-hosted runner* —
+   the `sudo -n ... || `-pattern (via `if`) never lets a failed sudo
+   invocation propagate as the step's own exit status; the `else`
+   branch's `::notice::` fires and the step still exits 0.  Verified,
+   not assumed: `.github/workflows/action-selftest.yml`'s
+   `simulate-no-sudo-fallthrough` job shadows `sudo` on `$PATH` with a
+   binary that always exits 1, ahead of the real one, then asserts (a)
+   the wrapped step still fails, (b) the failure text is exactly
+   `checkUserNamespacesAvailable`'s original message, and (c) that text
+   contains no mention of `sudo` — i.e. the real diagnosis isn't masked
+   by a sudo error. This is a permanent job in the self-test workflow,
+   not a one-off probe, so a future change that breaks the fallthrough
+   (e.g. someone later making the lift step `set -e`-fragile) fails CI
+   loudly instead of silently regressing.
+3. *`::notice::` causing user alarm about unexpected host mutation* —
+   addressed directly in the notice text itself (both branches), not
+   left to be inferred: the success notice states plainly that the
+   change is scoped to "this job's ephemeral runner VM only," does not
+   persist past the job, and touches no repository, account, or
+   self-hosted infrastructure beyond the one throwaway machine.
+
+**Consequences:**
+- Easy: INTENT.md §4 Phase 3's "three lines in a workflow file" promise
+  holds on stock `ubuntu-latest` as shipped today, with no caller-side
+  workaround required.
+- Accepted, documented: `action.yml` now runs one `sudo` command on the
+  runner, on every invocation where the sysctl is found restrictive.
+  This is real host-kernel-state mutation, not cosmetic — logged loudly
+  by design specifically so it's never a silent surprise in someone's
+  CI log.
+- If a *self-hosted* runner without passwordless sudo hits the
+  restricted case, Cordon's Action still fails there today — that gap
+  is real and unresolved by this change; the win here is stock
+  GitHub-hosted `ubuntu-latest`, not every possible runner. Worth an
+  explicit README/INTENT.md callout at Phase 3's "what Cordon does not
+  catch" documentation item, not yet written.
+- If GitHub ever removes passwordless sudo from hosted runners, or
+  further restricts what it covers, this step silently reverts to a
+  no-op-that-doesn't-help (falls to the `else` branch), and Cordon goes
+  back to failing legibly on ubuntu-latest the way it did before this
+  entry — not silently broken, just back to the prior, still-correct,
+  still-documented failure mode.
+
+**If asked to defend this:** "The lift only ever helps or does nothing
+— it can't make failures worse, because it's structured to never let a
+failed `sudo` call propagate as its own error; the binary's own
+pre-flight check is still there underneath it and still fires exactly
+as designed if the lift didn't happen. I didn't assume that fallthrough
+was clean — I shadowed `sudo` with one that always fails on a real
+runner and asserted the resulting error was still the original AppArmor
+message, not a sudo error, in a job that stays in CI permanently, not
+a throwaway probe. And this isn't a rootless-boundary violation: it's
+CI infrastructure privilege the hosted runner already grants its
+default user, spent on unblocking our own sandbox's prerequisite —
+the sandboxed command itself still runs with zero elevated privilege,
+unchanged."
+
+---
