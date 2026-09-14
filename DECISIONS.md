@@ -2614,3 +2614,101 @@ own check so they can't drift apart again, and wrote a real test that
 exercises all five value combinations — including the two 'looks
 restrictive but actually isn't' cases — rather than trusting the
 error-string reasoning alone."
+
+---
+
+## [2026-09-14] Confirmed on a real `ubuntu-latest` runner: unprivileged userns is AppArmor-gated by default — INTENT.md §3's open item resolved, unfavorably
+
+**Context:** INTENT.md §3 Platform has carried an open item since project
+setup: whether GitHub-hosted `ubuntu-latest` runners gate unprivileged
+user namespaces via AppArmor, "probed in CI as an early step, not
+assumed." Until today that was still an assumption, not a measurement —
+`action-selftest.yml` (composite GitHub Action self-test workflow) had
+never actually run on a hosted runner. No `gh` CLI or GitHub auth was
+available in this session at first; installed `gh` to `~/.local/bin`
+(no `sudo`, downloaded the release tarball directly) and had the user
+complete interactive `gh auth login`, since that step needs a human in
+the loop.
+
+**Triggering the run:** `action-selftest.yml` only fires on `push` to
+`main`, `pull_request`, or manual `workflow_dispatch` — pushing the
+`github-action` branch itself triggered nothing (not `main`, no PR yet).
+`workflow_dispatch` was tried first and rejected outright:
+`HTTP 404: workflow action-selftest.yml not found on the default
+branch` — GitHub requires a `workflow_dispatch`-triggerable workflow to
+already exist on the default branch before it can be dispatched via API,
+even when targeting a different ref, which this brand-new workflow file
+did not yet. `pull_request` has no such restriction — GitHub evaluates
+that trigger using the workflow file from the PR's own branch — so
+opened PR #1 (`github-action` → `main`, explicitly not for merging yet)
+specifically to get a real run, confirmed with the user before opening
+it since a PR is a shared, visible action.
+
+**Result — all three jobs failed identically, at the `Run ./` step:**
+```
+cordon: sandbox.Run: unprivileged user namespaces are restricted by
+AppArmor on this host (kernel.apparmor_restrict_unprivileged_userns=1)
+-- see INTENT.md §3 Platform
+```
+(Run: `SrilakshmiVadlamoodi/Cordon` Actions run 34860550812.) This is
+the AppArmor gate specifically — not the older
+`kernel.unprivileged_userns_clone=0` sysctl, which is unset/permissive
+on this image. Confirms `ubuntu-latest` has already rolled to a
+24.04-or-later base carrying the hardened AppArmor default, resolving
+INTENT.md §3's "not assumed" item: it *is* gated, unfavorably, on the
+exact runner image Cordon's own CI and Phase 3 distribution promise
+depend on.
+
+**What this is not:** not a Cordon bug. `checkUserNamespacesAvailable`
+(the entry directly above this one) worked exactly as built — the
+failure is the clear, specific, documented message it was designed to
+produce, not a bare `clone()` errno surfacing from deep inside
+`cmd.Start()`. The pre-flight check earned its keep on its very first
+real-world trigger.
+
+**What this blocks:** every job in `action-selftest.yml` fails as long
+as the AppArmor gate stands and nothing lifts it, including
+`high-finding-does-not-fail-the-step` — a job whose entire point is to
+prove a HIGH finding doesn't fail the wrapping CI step (INTENT.md §5),
+which it now can't even reach, since `cordon run` itself refuses to
+start first. Distribution's "three lines in a workflow file" promise
+(INTENT.md §4 Phase 3) is not deliverable as-is on stock
+`ubuntu-latest` without *some* additional step, whichever way that gets
+resolved.
+
+**Options for a fix, explored but not chosen yet (next entry covers the
+concrete lift-attempt and recommendation):**
+- Lift the AppArmor restriction as a runner-setup step, either inside
+  `action.yml` itself or documented as a required prerequisite step in
+  the consuming workflow.
+- Accept the limitation and document it plainly (README, INTENT.md) as
+  a known gap on hosted-runner CI, no code change.
+- Target self-hosted runners or a pre-hardened custom image only.
+
+**Consequences:**
+- INTENT.md §3's platform caveat is no longer speculative; it should be
+  reworded from "open item... must be probed" to state the confirmed
+  fact, once a fix direction is chosen (not edited yet — the fallback
+  sentence "run tests in a container, or set the sysctl explicitly" is
+  literally the lift option under investigation right now, so wait for
+  that outcome before rewriting the caveat).
+- `action-selftest.yml` stays red on every future push/PR touching it
+  until this is resolved one way or the other — expected, not a
+  regression to chase.
+- PR #1 stays open, unmerged, specifically to keep re-running this
+  workflow against candidate fixes without polluting `main`.
+
+**If asked to defend this:** "The open platform question INTENT.md
+carried since day one — does `ubuntu-latest` block unprivileged user
+namespaces — needed an actual hosted-runner run to answer, not another
+assumption. Getting one required installing `gh`, getting the user to
+authenticate it, and opening a PR (not a merge) just to trigger the
+`pull_request` event, because `workflow_dispatch` refuses to dispatch a
+workflow that doesn't exist on `main` yet. The answer came back
+unfavorable: yes, it's AppArmor-gated, confirmed by three identical
+runner failures naming the exact sysctl. The pre-flight error check
+built one entry earlier did its job — the failure is legible, not
+confusing — but the underlying blocker is real and needs an explicit
+fix before Phase 3's 'three lines' promise is true on stock CI."
+
+---
