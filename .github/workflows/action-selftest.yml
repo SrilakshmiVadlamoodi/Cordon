@@ -129,21 +129,21 @@ jobs:
             echo fake-key-for-selftest > "$HOME/.ssh/id_rsa" &&
             cat "$HOME/.ssh/id_rsa" >/dev/null
 
-      - name: DEBUG - dump GITHUB_STEP_SUMMARY path and content
-        shell: bash
-        run: |
-          echo "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY"
-          echo "--- exists? ---"
-          ls -la "$GITHUB_STEP_SUMMARY" 2>&1 || echo "MISSING"
-          echo "--- content ---"
-          cat "$GITHUB_STEP_SUMMARY" 2>&1 || echo "CAT FAILED"
-          echo "--- end content ---"
-
       - name: Verify the HIGH finding actually fired (not a vacuous pass)
+        # Reads the durable report file at RUNNER_TEMP, not
+        # $GITHUB_STEP_SUMMARY: each step gets its own distinct
+        # step-summary file (the runner only aggregates them for the
+        # job's rendered summary page afterward), so a later, separate
+        # step can never see an earlier step's $GITHUB_STEP_SUMMARY
+        # content by reading that env var itself (DECISIONS.md
+        # 2026-09-14, step-summary-is-per-step entry). The same pattern
+        # simulate-no-sudo-fallthrough's own verification step already
+        # uses correctly, above.
         shell: bash
         run: |
-          if ! grep -q "Credential file read" "$GITHUB_STEP_SUMMARY"; then
-            echo "::error::expected a 'Credential file read' HIGH finding in the step summary, found none — this job passing would otherwise prove nothing about the exit-code policy"
+          report="$RUNNER_TEMP/cordon-report.txt"
+          if [ ! -s "$report" ] || ! grep -q "Credential file read" "$report"; then
+            echo "::error::expected a 'Credential file read' HIGH finding in $report, found none — this job passing would otherwise prove nothing about the exit-code policy"
             exit 1
           fi
           echo "HIGH finding was reported above, and the previous step still succeeded — exit-code policy confirmed."

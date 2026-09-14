@@ -2982,3 +2982,98 @@ future reader would have to already know. I grepped the whole repo for
 the same pattern before closing this out; it was the only instance."
 
 ---
+
+## [2026-09-14] Correction to the entry above: the race fix was real, but not the cause of the CI failure — `$GITHUB_STEP_SUMMARY` is a distinct file per step, not one shared file per job
+
+**Context:** After pushing the process-substitution race fix above,
+`high-finding-does-not-fail-the-step` still failed, identically, on the
+very next run. The race fix itself was not wrong — it removes a real,
+now-confirmed timing bug — but it was not sufficient, because the
+actual cause of the CI failure was a second, independent bug this
+session had not yet found when the previous entry was written. Recorded
+here plainly, per this file's own stated policy of keeping wrong
+diagnoses on the record annotated with what was learned, rather than
+editing the previous entry to read as though this were caught the first
+time.
+
+**How it was actually found:** rather than guess again, added direct
+tracing on both sides of the boundary — inside `action.yml`'s own
+composite step (`wc -c` on `$CORDON_REPORT_FILE` and
+`$GITHUB_STEP_SUMMARY` immediately before and after the write) and in
+the workflow's separate verification step (dumping `$GITHUB_STEP_SUMMARY`'s
+path and content directly, rather than only its grep result). Compared
+side by side:
+- Inside the composite step: `GITHUB_STEP_SUMMARY=.../step_summary_3d882163-...`,
+  size 0 → 956 bytes, immediately after the write. The write worked.
+- In the later verification step, same job: `GITHUB_STEP_SUMMARY=.../step_summary_c0bf4b41-...`
+  — a **different file**, 0 bytes.
+
+**Root cause:** the GitHub Actions runner allocates a fresh
+step-summary file *per step*, not one file for the whole job. The `$GITHUB_STEP_SUMMARY`
+env var's value changes with every step. The runner aggregates every
+step's individual file into the job's rendered summary page in the web
+UI — which is why the feature itself (a human looking at the Job
+Summary page sees the behavior report) was almost certainly always
+working correctly once the race was fixed — but there is no mechanism
+by which one step can read *another* step's `$GITHUB_STEP_SUMMARY`
+content by following that env var; it structurally points somewhere
+else by the time a later step runs. The verification step was checking
+something that could never contain what it was looking for, regardless
+of whether `action.yml`'s write logic was correct or not. This is not a
+timing race like the previous entry — it would fail exactly the same
+way on every run, at any speed, forever, once this job's earlier steps
+ever got far enough to reach the write. It looked identical to the race
+symptom (grep finds nothing) purely by coincidence of both producing
+the same observable failure.
+
+**What this means about the previous entry:** the race in
+`2> >(tee ...)` was real, was fixed correctly, and the fix should stay
+— it removes a genuine, confirmed timing bug in how
+`$CORDON_REPORT_FILE` gets written, independent of this one. But that
+entry's framing ("this is what caused the CI failure") was incomplete:
+it explained a bug that existed, not the bug that was actually
+responsible for the test failure persisting. Both are logged as
+separate, independently-real findings from the same debugging session,
+not because one superseded the other.
+
+**Fix:** changed `high-finding-does-not-fail-the-step`'s verification
+step to grep the durable report file at
+`"$RUNNER_TEMP/cordon-report.txt"` directly — the same file
+`action.yml` itself writes `CORDON_REPORT_FILE` to, and the same
+pattern `simulate-no-sudo-fallthrough`'s own verification step already
+used correctly from the start (which is why that job passed on every
+run and this one didn't: it happened to check the right artifact by
+having been written with the file, not the step summary, in mind).
+`action.yml`'s own step-summary-writing logic was left unchanged — it
+was never actually broken for its real purpose.
+
+**Consequences:**
+- Easy: the fix is a one-line change to what the verification step
+  reads, not a change to any of Cordon's own behavior — the feature
+  this whole workflow exists to prove (HIGH finding doesn't fail the
+  step, and is visible in the summary) was working correctly the whole
+  time; only this repo's own test of it was checking an artifact that
+  could never hold the answer.
+- A concrete, on-the-record case of why "the fix looks right" was
+  explicitly rejected as a stopping point for this work (per direct
+  instruction) — the first fix was real and necessary but genuinely
+  insufficient, and only re-running against a live runner surfaced
+  that, exactly as intended.
+- Worth remembering for any future composite-action step that wants to
+  assert on `$GITHUB_STEP_SUMMARY` content written by an earlier step
+  in the same job: it can't be done via the env var in a later step;
+  read the underlying artifact the step actually produced instead, the
+  way this fix and `simulate-no-sudo-fallthrough` both now do.
+
+**If asked to defend this:** "The first fix wasn't wrong, it just
+wasn't the whole story — I traced both sides of the boundary with
+direct `wc -c` and file-path dumps instead of guessing a second time,
+and found the composite step's write actually succeeded; the later
+step's `$GITHUB_STEP_SUMMARY` just pointed at a completely different,
+empty file, because GitHub allocates a fresh step-summary file per
+step, not one for the whole job. The fix was to stop trying to read a
+prior step's summary through an env var that can't reach it, and check
+the durable report file directly instead — which is exactly what the
+one test job that passed on the first try was already doing."
+
+---
