@@ -27,6 +27,49 @@ const childEnvVar = "_CORDON_CHILD"
 // policy is a later concern.
 const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+// unprivilegedUserNSClonePath and apparmorRestrictUnprivilegedUserNSPath are
+// the two documented kernel/distro gates on unprivileged user namespaces
+// (INTENT.md §3 Platform, DECISIONS.md 2026-09-01). Package-level vars, not
+// inline string literals, so both checkUserNamespacesAvailable (the real
+// Run path, below) and the test suite's requireUserNS helper
+// (helpers_test.go) read from one shared source of truth instead of two
+// hand-copied path strings that could silently drift apart.
+var (
+	unprivilegedUserNSClonePath            = "/proc/sys/kernel/unprivileged_userns_clone"
+	apparmorRestrictUnprivilegedUserNSPath = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+)
+
+// checkUserNamespacesAvailable gives a clear, specific error when the host's
+// kernel or distro policy forbids unprivileged user namespaces, instead of
+// letting the low-level clone() failure reach the caller as a bare,
+// unattributed OS error (e.g. "operation not permitted") from deep inside
+// cmd.Start(). The test suite has its own t.Skip for this same condition
+// (requireUserNS), but that only fires under `go test` — a real `cordon
+// run` invocation (e.g. from the GitHub Action, features/github-action)
+// has no test runner to skip through, so it needs this production-path
+// equivalent to fail legibly instead.
+//
+// Best-effort, not exhaustive: only the two specific, documented gates are
+// checked. A clone() failure from some other cause (e.g. a namespace-count
+// ulimit, an unrelated LSM policy) still falls through to Run's existing
+// generic "starting sandbox child" error, unattributed the same as today —
+// this only improves the two known, named cases.
+func checkUserNamespacesAvailable() error {
+	if b, err := os.ReadFile(unprivilegedUserNSClonePath); err == nil {
+		if strings.TrimSpace(string(b)) == "0" {
+			return errors.New("unprivileged user namespaces are disabled on this host " +
+				"(kernel.unprivileged_userns_clone=0) -- see INTENT.md §3 Platform")
+		}
+	}
+	if b, err := os.ReadFile(apparmorRestrictUnprivilegedUserNSPath); err == nil {
+		if strings.TrimSpace(string(b)) == "1" {
+			return errors.New("unprivileged user namespaces are restricted by AppArmor on this host " +
+				"(kernel.apparmor_restrict_unprivileged_userns=1) -- see INTENT.md §3 Platform")
+		}
+	}
+	return nil
+}
+
 // namespaceFlags is the set of namespaces the child is cloned into.
 // CLONE_NEWUSER must ride in the same clone() as the rest: an unprivileged
 // process only gains the namespace-scoped CAP_SYS_ADMIN that the other flags
@@ -123,6 +166,9 @@ func Run(spec Spec) (Result, error) {
 	}
 	if fi, statErr := os.Stat(projectDir); statErr != nil || !fi.IsDir() {
 		return Result{}, fmt.Errorf("sandbox.Run: project dir %q is not an existing directory", projectDir)
+	}
+	if err := checkUserNamespacesAvailable(); err != nil {
+		return Result{}, fmt.Errorf("sandbox.Run: %w", err)
 	}
 
 	// A bare mountpoint on the host for the child's new-root tmpfs. The

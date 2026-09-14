@@ -2434,3 +2434,646 @@ Cordon-reviewed set of six directories; it now depends on whatever the
 invoker's PATH contains. That's a deliberate, logged tradeoff — read-only
 and env-var-forwarding excluded on purpose — not a scope creep we didn't
 notice."
+
+---
+
+## [2026-09-13] github-action: build and run are separate composite steps; exit code always mirrors the wrapped command; no annotations yet
+
+**Context:** First real external-facing surface (INTENT.md §4 Phase 3).
+Two defaults needed deciding deliberately rather than by habit: what
+happens when Cordon itself fails to even start, and whether a finding
+should ever fail the CI step.
+
+**Compile failure vs. wrapped-command failure — distinguishability
+checked, not assumed:** the composite action was first drafted as a
+single `go run $GITHUB_ACTION_PATH/cmd/cordon run -- <command>` step.
+Asked directly whether a `go run` compile failure would be
+distinguishable, at a glance, from the wrapped command simply exiting
+non-zero — since both would otherwise fail the same step under the same
+step name. They would not have been: a `bash -eo pipefail` composite
+step reports one pass/fail per step, and `go run`'s own build failure
+and its target's exit code both surface as "this step failed," visible
+only by reading the log text. Split into two steps instead: "Build
+Cordon" (`go build -o "$RUNNER_TEMP/cordon-bin" ./cmd/cordon`, in
+`$GITHUB_ACTION_PATH`) and "Run wrapped command under Cordon" (executes
+the built binary). Verified directly, not assumed: appended a syntax
+error to `cmd/cordon/main.go`, ran `go build` against it, confirmed a
+real, isolated failure (`exit 1`, a real compiler error) with the
+wrapped-command step never reached, then restored the file before
+committing. A user scanning a job's step list now sees which one failed
+without opening logs — "my install failed" vs. "Cordon itself is
+broken" are two different step names, not two readings of one.
+
+**Exit code / fail policy — checked against INTENT.md §5's actual
+wording, not defaulted to "fail on HIGH" the way a security scanner
+normally would:** §5 states plainly, as a non-goal: "Blocking installs
+by default. Cordon reports; the human decides." `cmd/cordon`'s `run()`
+(`main.go`) already, unconditionally, returns `res.ExitCode` — the
+wrapped command's own exit status — regardless of what
+`behaviorreport.Generate` found; no code path today lets a finding
+change the process's exit code. The Action's "Run wrapped command under
+Cordon" step therefore captures the wrapped binary's exit status
+explicitly (`set +e` first — a composite step is otherwise `bash -e`,
+which would abort before the step-summary write the moment the wrapped
+command failed) and re-exits with exactly that value. No configurable
+"fail on HIGH" input was added. Considered and rejected for this slice:
+building one honestly requires `cmd/cordon` to expose a distinct,
+structured "there were HIGH findings" signal separate from
+`res.ExitCode` — none exists today, and faking one by grepping the
+Action's own plain-text report for `[HIGH]` would be exactly the
+fragile, text-format-coupled shortcut this project avoids elsewhere
+(see the annotations decision below). Named as a real, specific
+follow-up (a `--fail-on` flag or a machine-readable output mode in
+`cmd/cordon` itself), not silently dropped.
+
+**Findings surfacing — passthrough plus step summary, no annotations
+yet:** the behavior report is already written to stderr
+(DECISIONS.md 2026-09-05), so an unmodified `run:` step already places
+it in the job log in the same order a bare invocation would, with zero
+wrapper logic. Verified locally (not yet on a real runner — see the
+Done-checklist item still open in `features/github-action/intent.md`):
+`tee`ing stderr to a file for the step summary does not alter what
+reaches the log, in either the no-findings case or the HIGH-finding
+case. The same text is also appended to `$GITHUB_STEP_SUMMARY` as a
+fenced code block. GitHub Actions `::warning::`/`::error::` annotations
+were considered and deferred, not built: producing accurate ones means
+parsing `behaviorreport.WriteText`'s plain-text output for
+severity/title, which would couple the Action's correctness to a text
+format with no stability contract today (no struct/JSON export exists
+in `internal/behaviorreport`). Same shape of tradeoff as the fail-policy
+decision above — declining to build a feature on a scrape of another
+package's incidental string output, twice in the same slice, not a
+coincidence.
+
+**Consequences:**
+- Easy: a user gets accurate signal about *what* broke (Cordon vs. the
+  install) without reading a single log line, and the exit-code
+  contract that already existed in `cmd/cordon` needed zero changes to
+  extend correctly into CI.
+- Deferred, named explicitly: a configurable fail-on-severity gate, and
+  annotation-based surfacing — both blocked on the same missing
+  upstream piece (a structured signal from `cmd/cordon` beyond
+  `res.ExitCode` and a plain-text report), not on Action-side effort.
+- Unverified until CI actually runs `.github/workflows/action-selftest.yml`:
+  everything above was checked against the real built binary run
+  locally, on this WSL2 dev machine, which already has unprivileged
+  userns available — whether GitHub's hosted `ubuntu-latest` also does,
+  or the AppArmor gate (DECISIONS.md 2026-09-01) blocks it, is still an
+  open question this workflow exists to answer for real, not assume.
+
+**If asked to defend this:** "Splitting build and run into separate
+composite steps was checked, not assumed to be enough: I broke the
+build on purpose and confirmed the failure lands on a differently-named
+step than a wrapped-command failure would. The exit-code policy isn't
+'fail on HIGH like a normal scanner' — INTENT.md §5 says plainly that
+Cordon reports and the human decides, and `cmd/cordon` already never
+lets a finding change its exit code, so the Action just has to preserve
+that contract faithfully, which meant explicitly capturing and
+re-exiting the wrapped binary's own status under `set +e`. I declined to
+fake a 'fail on HIGH' option or real annotations by scraping Cordon's
+own plain-text report for keywords, because that couples a CI-facing
+feature to a format with zero stability guarantees — both are named as
+real follow-ups that belong in `cmd/cordon` itself, not the Action."
+
+---
+
+## [2026-09-13] Pre-push check: the unprivileged-userns t.Skip only covers `go test`, not a real `cordon run` — production path had no equivalent
+
+**Context:** Before pushing `github-action` to actually exercise
+`action-selftest.yml` on GitHub's hosted `ubuntu-latest` runner — the
+first real test of whether unprivileged user namespaces are available
+there, or the AppArmor gate blocks them (INTENT.md §3, DECISIONS.md
+2026-09-01) — checked whether a restricted runner would fail legibly
+or confusingly.
+
+**What was checked:** `internal/sandbox/helpers_test.go`'s `requireUserNS`
+(the two sysctl probes, `unprivileged_userns_clone` and
+`apparmor_restrict_unprivileged_userns`) is not bit-rotted — both paths
+and both comparison values still match DECISIONS.md 2026-09-01 exactly.
+But that function only runs under `go test`, and `action-selftest.yml`
+never runs `go test` — it builds and runs the real `cordon` binary via
+the composite action. On a restricted runner, `sandbox.Run`'s existing
+`cmd.Start()` failure path (`run_linux.go`, "starting sandbox child")
+would have surfaced whatever raw OS error `clone()` returns (e.g.
+`operation not permitted`) — attributable to the right *step* ("Run
+wrapped command under Cordon"), but not to the right *cause*: nothing in
+that message would tell a reader this is the specific, documented,
+known host-policy gate rather than some other permissions problem in
+Cordon itself.
+
+**Chose:** Added `checkUserNamespacesAvailable` (`run_linux.go`) — the
+production-path equivalent of `requireUserNS` — called at the top of
+`Run`, before any namespace or child-process setup, returning a
+specific, named error ("unprivileged user namespaces are disabled on
+this host (kernel.unprivileged_userns_clone=0) -- see INTENT.md §3
+Platform", and the AppArmor equivalent) for exactly the two documented
+gates. Both the production check and the test's `requireUserNS` now
+read from the same two package-level path vars
+(`unprivilegedUserNSClonePath`, `apparmorRestrictUnprivilegedUserNSPath`)
+instead of two independently hand-copied literal strings — the second
+copy is exactly how this kind of check silently drifts out of sync with
+its own test in the first place. `requireUserNS` itself now just calls
+`checkUserNamespacesAvailable` through a `CheckUserNamespacesAvailableForTest`
+export-test shim, so there is one implementation, not two.
+
+**Deliberately not exhaustive:** only the two named, documented gates are
+checked. A `clone()` failure from any other cause (a namespace-count
+ulimit, an unrelated LSM policy neither of us has hit yet) still falls
+through to the existing generic "starting sandbox child" error,
+unattributed exactly as before — this closes the two specific cases
+INTENT.md already commits to explaining, not every conceivable clone()
+failure.
+
+**Verified, not just argued:** `TestCheckUserNamespacesAvailable`
+(`usernscheck_linux_test.go`) exercises all five cases directly via the
+injectable path vars pointed at real temp files — both restricted
+branches, both matching-but-unrestricted values (`1` for the clone
+sysctl, `0` for the AppArmor one — the "looks similar but means the
+opposite" case a careless read of either check could get backwards),
+and the missing-file case (an unpatched kernel with neither sysctl at
+all). All five pass. Full suite (`go test ./...`) re-run clean after
+the `requireUserNS` refactor.
+
+**Consequences:**
+- If `ubuntu-latest` does turn out to gate unprivileged userns, the
+  push about to happen will fail with a message that names the exact
+  sysctl and value, not a bare OS errno string — legible without
+  needing to already know INTENT.md §3's platform caveats by heart.
+- This was caught and fixed *before* the first real run, specifically
+  because it was asked for directly rather than trusted from "the test
+  suite already handles this" — the test suite handling it and the
+  production binary handling it are two different claims, and only one
+  of them was true until now.
+
+**If asked to defend this:** "I was asked to confirm a restricted host
+would fail with the documented t.Skip message, not something confusing
+downstream. It wouldn't have — the skip only exists for `go test`, and
+the GitHub Action runs the real binary, which had no equivalent check
+at all. I added one, sharing the same two sysctl paths as the test's
+own check so they can't drift apart again, and wrote a real test that
+exercises all five value combinations — including the two 'looks
+restrictive but actually isn't' cases — rather than trusting the
+error-string reasoning alone."
+
+---
+
+## [2026-09-14] Confirmed on a real `ubuntu-latest` runner: unprivileged userns is AppArmor-gated by default — INTENT.md §3's open item resolved, unfavorably
+
+**Context:** INTENT.md §3 Platform has carried an open item since project
+setup: whether GitHub-hosted `ubuntu-latest` runners gate unprivileged
+user namespaces via AppArmor, "probed in CI as an early step, not
+assumed." Until today that was still an assumption, not a measurement —
+`action-selftest.yml` (composite GitHub Action self-test workflow) had
+never actually run on a hosted runner. No `gh` CLI or GitHub auth was
+available in this session at first; installed `gh` to `~/.local/bin`
+(no `sudo`, downloaded the release tarball directly) and had the user
+complete interactive `gh auth login`, since that step needs a human in
+the loop.
+
+**Triggering the run:** `action-selftest.yml` only fires on `push` to
+`main`, `pull_request`, or manual `workflow_dispatch` — pushing the
+`github-action` branch itself triggered nothing (not `main`, no PR yet).
+`workflow_dispatch` was tried first and rejected outright:
+`HTTP 404: workflow action-selftest.yml not found on the default
+branch` — GitHub requires a `workflow_dispatch`-triggerable workflow to
+already exist on the default branch before it can be dispatched via API,
+even when targeting a different ref, which this brand-new workflow file
+did not yet. `pull_request` has no such restriction — GitHub evaluates
+that trigger using the workflow file from the PR's own branch — so
+opened PR #1 (`github-action` → `main`, explicitly not for merging yet)
+specifically to get a real run, confirmed with the user before opening
+it since a PR is a shared, visible action.
+
+**Result — all three jobs failed identically, at the `Run ./` step:**
+```
+cordon: sandbox.Run: unprivileged user namespaces are restricted by
+AppArmor on this host (kernel.apparmor_restrict_unprivileged_userns=1)
+-- see INTENT.md §3 Platform
+```
+(Run: `SrilakshmiVadlamoodi/Cordon` Actions run 34860550812.) This is
+the AppArmor gate specifically — not the older
+`kernel.unprivileged_userns_clone=0` sysctl, which is unset/permissive
+on this image. Confirms `ubuntu-latest` has already rolled to a
+24.04-or-later base carrying the hardened AppArmor default, resolving
+INTENT.md §3's "not assumed" item: it *is* gated, unfavorably, on the
+exact runner image Cordon's own CI and Phase 3 distribution promise
+depend on.
+
+**What this is not:** not a Cordon bug. `checkUserNamespacesAvailable`
+(the entry directly above this one) worked exactly as built — the
+failure is the clear, specific, documented message it was designed to
+produce, not a bare `clone()` errno surfacing from deep inside
+`cmd.Start()`. The pre-flight check earned its keep on its very first
+real-world trigger.
+
+**What this blocks:** every job in `action-selftest.yml` fails as long
+as the AppArmor gate stands and nothing lifts it, including
+`high-finding-does-not-fail-the-step` — a job whose entire point is to
+prove a HIGH finding doesn't fail the wrapping CI step (INTENT.md §5),
+which it now can't even reach, since `cordon run` itself refuses to
+start first. Distribution's "three lines in a workflow file" promise
+(INTENT.md §4 Phase 3) is not deliverable as-is on stock
+`ubuntu-latest` without *some* additional step, whichever way that gets
+resolved.
+
+**Options for a fix, explored but not chosen yet (next entry covers the
+concrete lift-attempt and recommendation):**
+- Lift the AppArmor restriction as a runner-setup step, either inside
+  `action.yml` itself or documented as a required prerequisite step in
+  the consuming workflow.
+- Accept the limitation and document it plainly (README, INTENT.md) as
+  a known gap on hosted-runner CI, no code change.
+- Target self-hosted runners or a pre-hardened custom image only.
+
+**Consequences:**
+- INTENT.md §3's platform caveat is no longer speculative; it should be
+  reworded from "open item... must be probed" to state the confirmed
+  fact, once a fix direction is chosen (not edited yet — the fallback
+  sentence "run tests in a container, or set the sysctl explicitly" is
+  literally the lift option under investigation right now, so wait for
+  that outcome before rewriting the caveat).
+- `action-selftest.yml` stays red on every future push/PR touching it
+  until this is resolved one way or the other — expected, not a
+  regression to chase.
+- PR #1 stays open, unmerged, specifically to keep re-running this
+  workflow against candidate fixes without polluting `main`.
+
+**If asked to defend this:** "The open platform question INTENT.md
+carried since day one — does `ubuntu-latest` block unprivileged user
+namespaces — needed an actual hosted-runner run to answer, not another
+assumption. Getting one required installing `gh`, getting the user to
+authenticate it, and opening a PR (not a merge) just to trigger the
+`pull_request` event, because `workflow_dispatch` refuses to dispatch a
+workflow that doesn't exist on `main` yet. The answer came back
+unfavorable: yes, it's AppArmor-gated, confirmed by three identical
+runner failures naming the exact sysctl. The pre-flight error check
+built one entry earlier did its job — the failure is legible, not
+confusing — but the underlying blocker is real and needs an explicit
+fix before Phase 3's 'three lines' promise is true on stock CI."
+
+---
+
+## [2026-09-14] AppArmor userns gate: fix chosen — best-effort sysctl lift inside action.yml, loud and non-fatal, not a required prerequisite step
+
+**Context:** Direct follow-on to the entry above. Three options were on
+the table for the confirmed `ubuntu-latest` AppArmor block: lift the
+restriction from inside `action.yml` itself, document a required
+prerequisite step in every consuming workflow, or accept the limitation
+and restrict Cordon's GitHub Action to self-hosted/pre-hardened runners
+only. Before choosing, ran a dedicated probe job
+(`probe-apparmor-lift`, since removed — its findings are recorded here,
+not left live as a standing job) to test the lift concretely rather than
+assume it would work:
+- `sudo -n /sbin/sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+  succeeded non-interactively as the default `actions` runner user —
+  confirmed, not assumed, that passwordless sudo covers this specific
+  write.
+- The lifted value (`0`) was still in effect in a later, separate step
+  of the same job — confirmed the runner-level sysctl persists for the
+  job's own remaining steps, as expected of a per-VM kernel setting.
+- `unshare --user --map-root-user` succeeded after the lift, confirming
+  it unblocks actual userns creation, not just the sysctl read-back.
+
+**Options considered:**
+- **Required prerequisite step**, documented for every consuming
+  workflow to add before `uses: ./`. Most honest about what's
+  happening — nothing hidden inside the action. Rejected: it
+  permanently breaks INTENT.md §4 Phase 3's stated distribution goal
+  ("GitHub Action wrapper (three lines in a workflow file)") for every
+  single user, over an Ubuntu-version-specific AppArmor default that is
+  an implementation detail of *our* rootless architecture, not
+  something a caller should need to already know about to use Cordon at
+  all.
+- **Restrict to self-hosted/pre-hardened runners only**, document the
+  gap, no code change. Simplest, but concedes the actual target
+  audience (anyone with a stock `ubuntu-latest` workflow) up front,
+  which is most of Phase 3's intended users.
+- **Best-effort lift inside `action.yml`, loud, falling through to the
+  existing error on failure.** (Chosen; see below.)
+
+**Chose:** A new `action.yml` step, "Lift AppArmor unprivileged-userns
+restriction (best-effort)", runs immediately after the existing "Check
+platform" step and before Go is set up or Cordon is built. It: reads
+`/proc/sys/kernel/apparmor_restrict_unprivileged_userns` directly (no
+dependency on `sysctl` existing for the *read*, only for the *write*);
+exits 0 immediately if the file is absent or already not `1` (nothing
+to do — most hosts, including any pre-5.10-hardened distro or a runner
+where this was already fixed upstream, hit this path and the step is a
+no-op); otherwise attempts
+`sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+On success, emits `::notice::` naming exactly what changed, why, and
+its scope. On failure (`sudo` missing, not passwordless, or refused),
+emits a different `::notice::` saying so and naming the specific
+downstream error to expect — then the step still exits 0. Either way,
+`checkUserNamespacesAvailable` (`run_linux.go`, the entry two above
+this one) runs unchanged, later, inside the built binary — this step
+never touches or short-circuits it, only tries to make its check
+unnecessary.
+
+**Why "best-effort, falls through" instead of a hard requirement:** the
+whole point of `checkUserNamespacesAvailable` existing is that Cordon
+must never fail confusingly when a namespace can't be created — it
+fails with a specific, named reason. A lift step that *required*
+success (erroring out if `sudo -n` failed) would reintroduce exactly
+the failure mode that check was built to prevent, just one layer
+earlier and over a different cause: on a self-hosted runner without
+passwordless sudo, a hard-required lift step would abort with a sudo
+permission error that has nothing to do with the real, already-legible
+diagnosis the binary itself is fully capable of producing on its own.
+Best-effort means the lift step can only ever *help* (turn a would-be
+failure into a pass) or be a no-op (leave the existing, already-correct
+failure path exactly as before) — it has no code path that makes
+things worse than not having it at all.
+
+**Why this doesn't compromise the "no sudo" rootless ground rule:**
+CLAUDE.md and INTENT.md's "rootless: no sudo, no setuid helper" rule
+governs how the *wrapped command* gets confined — the sandboxed child
+process itself must never require or receive elevated privilege to run
+under Cordon, and nothing about this step touches that: the wrapped
+command still runs in exactly the same unprivileged user namespace as
+before, with the same single UID mapping (DECISIONS.md 2026-09-01), and
+`sandbox.Run`'s own code path calls no `sudo` and gained none. What
+this step uses `sudo` for is CI *infrastructure* setup — adjusting a
+host kernel toggle on the runner VM itself, before Cordon's binary is
+even built — which is a different layer entirely: the same distinction
+as a Dockerfile's build stage running as root to install packages while
+the resulting container runs unprivileged. A GitHub-hosted runner
+already grants its default user passwordless sudo for general system
+administration (that is what made the lift possible at all); using a
+sliver of that pre-existing CI-infrastructure privilege to unblock our
+own sandbox's prerequisite is not the same claim as "Cordon's sandbox
+needs privilege to confine a process," which remains false.
+
+**Why this degrades safely, concretely:** three failure modes were
+worth naming and each was checked or reasoned through, not assumed:
+1. *Sysctl already permissive* (older kernel, different distro, a
+   runner image that fixes this upstream later) — the `!= "1"` check
+   makes the step a silent no-op; no `sudo` call is even attempted.
+2. *No `sudo` at all, or not passwordless, on a self-hosted runner* —
+   the `sudo -n ... || `-pattern (via `if`) never lets a failed sudo
+   invocation propagate as the step's own exit status; the `else`
+   branch's `::notice::` fires and the step still exits 0.  Verified,
+   not assumed: `.github/workflows/action-selftest.yml`'s
+   `simulate-no-sudo-fallthrough` job shadows `sudo` on `$PATH` with a
+   binary that always exits 1, ahead of the real one, then asserts (a)
+   the wrapped step still fails, (b) the failure text is exactly
+   `checkUserNamespacesAvailable`'s original message, and (c) that text
+   contains no mention of `sudo` — i.e. the real diagnosis isn't masked
+   by a sudo error. This is a permanent job in the self-test workflow,
+   not a one-off probe, so a future change that breaks the fallthrough
+   (e.g. someone later making the lift step `set -e`-fragile) fails CI
+   loudly instead of silently regressing.
+3. *`::notice::` causing user alarm about unexpected host mutation* —
+   addressed directly in the notice text itself (both branches), not
+   left to be inferred: the success notice states plainly that the
+   change is scoped to "this job's ephemeral runner VM only," does not
+   persist past the job, and touches no repository, account, or
+   self-hosted infrastructure beyond the one throwaway machine.
+
+**Consequences:**
+- Easy: INTENT.md §4 Phase 3's "three lines in a workflow file" promise
+  holds on stock `ubuntu-latest` as shipped today, with no caller-side
+  workaround required.
+- Accepted, documented: `action.yml` now runs one `sudo` command on the
+  runner, on every invocation where the sysctl is found restrictive.
+  This is real host-kernel-state mutation, not cosmetic — logged loudly
+  by design specifically so it's never a silent surprise in someone's
+  CI log.
+- If a *self-hosted* runner without passwordless sudo hits the
+  restricted case, Cordon's Action still fails there today — that gap
+  is real and unresolved by this change; the win here is stock
+  GitHub-hosted `ubuntu-latest`, not every possible runner. Worth an
+  explicit README/INTENT.md callout at Phase 3's "what Cordon does not
+  catch" documentation item, not yet written.
+- If GitHub ever removes passwordless sudo from hosted runners, or
+  further restricts what it covers, this step silently reverts to a
+  no-op-that-doesn't-help (falls to the `else` branch), and Cordon goes
+  back to failing legibly on ubuntu-latest the way it did before this
+  entry — not silently broken, just back to the prior, still-correct,
+  still-documented failure mode.
+
+**If asked to defend this:** "The lift only ever helps or does nothing
+— it can't make failures worse, because it's structured to never let a
+failed `sudo` call propagate as its own error; the binary's own
+pre-flight check is still there underneath it and still fires exactly
+as designed if the lift didn't happen. I didn't assume that fallthrough
+was clean — I shadowed `sudo` with one that always fails on a real
+runner and asserted the resulting error was still the original AppArmor
+message, not a sudo error, in a job that stays in CI permanently, not
+a throwaway probe. And this isn't a rootless-boundary violation: it's
+CI infrastructure privilege the hosted runner already grants its
+default user, spent on unblocking our own sandbox's prerequisite —
+the sandboxed command itself still runs with zero elevated privilege,
+unchanged."
+
+---
+
+## [2026-09-14] Pre-existing race in action.yml's step-summary write: `2> >(tee ...)` process substitution not waited on
+
+**Context:** Distinct from, and not caused by, the two AppArmor entries
+directly above. Once the AppArmor lift let `high-finding-does-not-fail-the-step`'s
+`Run ./` step actually complete successfully on a real runner for the
+first time ever — every previous run on this job had failed earlier,
+blocked by the userns restriction before this code path was ever
+reached — its follow-up verification step
+(`grep -q "Credential file read" "$GITHUB_STEP_SUMMARY"`) failed anyway,
+even though cordon's own stderr output, visible in the same job's log,
+plainly showed the HIGH finding firing correctly
+(`[HIGH] Credential file read`, full report body). This bug predates
+today's session entirely — `action.yml`'s "Run wrapped command under
+Cordon" step has looked like this since the `github-action` feature was
+first built — and was never reproducible locally on this machine's
+WSL2 dev environment; it only surfaced once a real GitHub-hosted runner
+executed this exact step end-to-end fast enough to expose the timing
+window.
+
+**Root cause:**
+```bash
+"$CORDON_BIN" run sh -c "$CORDON_RUN_CMD" 2> >(tee "$CORDON_REPORT_FILE" >&2)
+status=$?
+if [ -s "$CORDON_REPORT_FILE" ]; then ...
+```
+`2> >(tee "$CORDON_REPORT_FILE" >&2)` is process substitution: bash
+forks `tee` as an asynchronous subshell reading from a pipe connected to
+the foreground command's stderr, and — unlike `$(...)` command
+substitution — does **not** wait for that subshell to finish before
+continuing to the next line. `status=$?` captures `cordon-bin`'s own
+exit code correctly (that part was never wrong), but the very next
+line's `[ -s "$CORDON_REPORT_FILE" ]` check can run before `tee` has
+finished writing and flushing the file to disk. On this job, the whole
+composite step completed in 32ms once the binary was built (per the
+Actions API's own `end-action` duration for that step) — fast enough
+that the race was lost: the file check saw it as empty (or not yet
+fully written) and the `>> "$GITHUB_STEP_SUMMARY"` block never ran, so
+the report that GitHub's own log capture clearly received (it reads the
+process's stderr FD directly, independent of our `tee`) never made it
+into the step summary our own verification step greps.
+
+**Why this test job is what caught it, and no earlier one did:**
+`benign-command` and `setup-node-path-forwarding` never write a report
+(no findings, so `-s "$CORDON_REPORT_FILE"` is false either way — a
+race on an empty file has no observable effect). Only a job whose
+wrapped command both (a) produces a finding worth writing to the
+summary and (b) had ever gotten far enough to run this step to
+completion could expose it — `high-finding-does-not-fail-the-step` is
+the only job in `action-selftest.yml` that does both, and it had never
+once reached this code path successfully before the AppArmor lift, on
+any of this session's earlier runs or (per `git log`) any run before
+this session existed at all.
+
+**Options considered:**
+- **Add an explicit `wait` after the command**, to block until the
+  process-substitution subshell finishes. Works in bash, but relies on
+  `wait`'s handling of process-substitution PIDs specifically (not
+  guaranteed obviously correct to a reader without knowing that detail)
+  and keeps the two-stream complexity (live tee + separate file) for no
+  remaining benefit once synchronous behavior is required anyway.
+- **Redirect stderr straight to the file, `cat` it back afterward**
+  (chosen). No process substitution, no subshell to race against: a
+  plain `2>"$CORDON_REPORT_FILE"` redirect is synchronous by
+  construction, so the file is guaranteed complete the instant the
+  command returns. Costs the live-streaming property — the report now
+  appears in the log only after the wrapped command finishes, instead
+  of interleaved with its stdout as it runs — accepted, since nothing
+  in `github-action/intent.md`'s Done checklist asks for interleaved
+  live output, only that stdout/stderr and the exit code end up
+  correct.
+
+**Chose:** Plain redirect (`2>"$CORDON_REPORT_FILE"` then
+`cat "$CORDON_REPORT_FILE" >&2`), replacing the process substitution
+entirely.
+
+**Verified not an isolated instance:** grepped the whole repository
+(`grep -rn ">(tee\|process substitution\|>(.*)"` across `.go`, `.yml`,
+`.yaml`, `.sh`) for the same `2> >(...)` pattern before considering this
+closed — `action.yml` line 85 (pre-fix) was the only match in the
+codebase. No other script or workflow carries the identical race.
+
+**Consequences:**
+- Easy: the fix is strictly simpler than what it replaces — one
+  redirect and one `cat`, no subshell, no timing dependency to reason
+  about at all, not just a narrower window.
+- Accepted: log output for the wrapped command's stderr (including the
+  behavior report) now appears after the command completes rather than
+  streamed live alongside its stdout. For a command that also produces
+  substantial stdout output, a reader watching the raw log in real time
+  loses interleaving they'd have had before — a real but minor
+  regression in log readability, not in correctness.
+- This is exactly the kind of bug INTENT.md's "an install must not take
+  noticeably longer... measured, not assumed" mandate — and CLAUDE.md's
+  "re-verify now, on this machine" instruction — exists to catch, except
+  this one was a *correctness* race no local re-run could have caught:
+  WSL2's timing characteristics for this exact code path never lost the
+  race in this session's or presumably any prior local testing, and the
+  bug was invisible until it ran on real GitHub-hosted infrastructure.
+  Worth remembering as a concrete, on-the-record example of why "tests
+  passed locally" was never trusted as sufficient for this feature.
+
+**If asked to defend this:** "This bug has been sitting in action.yml
+since the feature was first written — it's not something today's
+AppArmor work introduced, just something that work's fix finally let
+run far enough to expose, on a job fast enough to lose the race. Process
+substitution spawns an async subshell that bash doesn't wait for, so
+checking the file it's writing to on the very next line is inherently
+racy. The fix removes the race by construction — a synchronous redirect
+instead of a background tee — rather than papering over it with an
+explicit wait call whose correctness would depend on bash internals a
+future reader would have to already know. I grepped the whole repo for
+the same pattern before closing this out; it was the only instance."
+
+---
+
+## [2026-09-14] Correction to the entry above: the race fix was real, but not the cause of the CI failure — `$GITHUB_STEP_SUMMARY` is a distinct file per step, not one shared file per job
+
+**Context:** After pushing the process-substitution race fix above,
+`high-finding-does-not-fail-the-step` still failed, identically, on the
+very next run. The race fix itself was not wrong — it removes a real,
+now-confirmed timing bug — but it was not sufficient, because the
+actual cause of the CI failure was a second, independent bug this
+session had not yet found when the previous entry was written. Recorded
+here plainly, per this file's own stated policy of keeping wrong
+diagnoses on the record annotated with what was learned, rather than
+editing the previous entry to read as though this were caught the first
+time.
+
+**How it was actually found:** rather than guess again, added direct
+tracing on both sides of the boundary — inside `action.yml`'s own
+composite step (`wc -c` on `$CORDON_REPORT_FILE` and
+`$GITHUB_STEP_SUMMARY` immediately before and after the write) and in
+the workflow's separate verification step (dumping `$GITHUB_STEP_SUMMARY`'s
+path and content directly, rather than only its grep result). Compared
+side by side:
+- Inside the composite step: `GITHUB_STEP_SUMMARY=.../step_summary_3d882163-...`,
+  size 0 → 956 bytes, immediately after the write. The write worked.
+- In the later verification step, same job: `GITHUB_STEP_SUMMARY=.../step_summary_c0bf4b41-...`
+  — a **different file**, 0 bytes.
+
+**Root cause:** the GitHub Actions runner allocates a fresh
+step-summary file *per step*, not one file for the whole job. The `$GITHUB_STEP_SUMMARY`
+env var's value changes with every step. The runner aggregates every
+step's individual file into the job's rendered summary page in the web
+UI — which is why the feature itself (a human looking at the Job
+Summary page sees the behavior report) was almost certainly always
+working correctly once the race was fixed — but there is no mechanism
+by which one step can read *another* step's `$GITHUB_STEP_SUMMARY`
+content by following that env var; it structurally points somewhere
+else by the time a later step runs. The verification step was checking
+something that could never contain what it was looking for, regardless
+of whether `action.yml`'s write logic was correct or not. This is not a
+timing race like the previous entry — it would fail exactly the same
+way on every run, at any speed, forever, once this job's earlier steps
+ever got far enough to reach the write. It looked identical to the race
+symptom (grep finds nothing) purely by coincidence of both producing
+the same observable failure.
+
+**What this means about the previous entry:** the race in
+`2> >(tee ...)` was real, was fixed correctly, and the fix should stay
+— it removes a genuine, confirmed timing bug in how
+`$CORDON_REPORT_FILE` gets written, independent of this one. But that
+entry's framing ("this is what caused the CI failure") was incomplete:
+it explained a bug that existed, not the bug that was actually
+responsible for the test failure persisting. Both are logged as
+separate, independently-real findings from the same debugging session,
+not because one superseded the other.
+
+**Fix:** changed `high-finding-does-not-fail-the-step`'s verification
+step to grep the durable report file at
+`"$RUNNER_TEMP/cordon-report.txt"` directly — the same file
+`action.yml` itself writes `CORDON_REPORT_FILE` to, and the same
+pattern `simulate-no-sudo-fallthrough`'s own verification step already
+used correctly from the start (which is why that job passed on every
+run and this one didn't: it happened to check the right artifact by
+having been written with the file, not the step summary, in mind).
+`action.yml`'s own step-summary-writing logic was left unchanged — it
+was never actually broken for its real purpose.
+
+**Consequences:**
+- Easy: the fix is a one-line change to what the verification step
+  reads, not a change to any of Cordon's own behavior — the feature
+  this whole workflow exists to prove (HIGH finding doesn't fail the
+  step, and is visible in the summary) was working correctly the whole
+  time; only this repo's own test of it was checking an artifact that
+  could never hold the answer.
+- A concrete, on-the-record case of why "the fix looks right" was
+  explicitly rejected as a stopping point for this work (per direct
+  instruction) — the first fix was real and necessary but genuinely
+  insufficient, and only re-running against a live runner surfaced
+  that, exactly as intended.
+- Worth remembering for any future composite-action step that wants to
+  assert on `$GITHUB_STEP_SUMMARY` content written by an earlier step
+  in the same job: it can't be done via the env var in a later step;
+  read the underlying artifact the step actually produced instead, the
+  way this fix and `simulate-no-sudo-fallthrough` both now do.
+
+**If asked to defend this:** "The first fix wasn't wrong, it just
+wasn't the whole story — I traced both sides of the boundary with
+direct `wc -c` and file-path dumps instead of guessing a second time,
+and found the composite step's write actually succeeded; the later
+step's `$GITHUB_STEP_SUMMARY` just pointed at a completely different,
+empty file, because GitHub allocates a fresh step-summary file per
+step, not one for the whole job. The fix was to stop trying to read a
+prior step's summary through an env var that can't reach it, and check
+the durable report file directly instead — which is exactly what the
+one test job that passed on the first try was already doing."
+
+---
