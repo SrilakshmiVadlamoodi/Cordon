@@ -13,6 +13,24 @@ catch — is Phase 3 scope
 ([`features/false-positive-rate/intent.md`](features/false-positive-rate/intent.md)),
 not attempted here.
 
+## Usage in CI (GitHub Actions)
+
+```yaml
+- uses: actions/checkout@v4
+- uses: SrilakshmiVadlamoodi/cordon@main   # pin to a commit SHA until a tagged release exists
+  with:
+    run: npm ci
+```
+
+Compiles Cordon from source on each run (`go build`, pinned to this
+repo's own `go.mod` Go version — no released binaries exist yet, see
+[`features/github-action/intent.md`](features/github-action/intent.md)),
+runs `npm ci` inside the sandbox, and appends the behavior report to the
+job's step summary. **A finding never fails the step by itself** —
+INTENT.md §5: "Blocking installs by default. Cordon reports; the human
+decides." Only the wrapped command's own exit code can fail the step.
+Linux runners only (`ubuntu-latest`), per INTENT.md §3.
+
 ## False-positive rate
 
 **0 / 8** benign-labeled fixtures in Cordon's own test corpus produce an
