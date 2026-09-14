@@ -2867,3 +2867,118 @@ the sandboxed command itself still runs with zero elevated privilege,
 unchanged."
 
 ---
+
+## [2026-09-14] Pre-existing race in action.yml's step-summary write: `2> >(tee ...)` process substitution not waited on
+
+**Context:** Distinct from, and not caused by, the two AppArmor entries
+directly above. Once the AppArmor lift let `high-finding-does-not-fail-the-step`'s
+`Run ./` step actually complete successfully on a real runner for the
+first time ever — every previous run on this job had failed earlier,
+blocked by the userns restriction before this code path was ever
+reached — its follow-up verification step
+(`grep -q "Credential file read" "$GITHUB_STEP_SUMMARY"`) failed anyway,
+even though cordon's own stderr output, visible in the same job's log,
+plainly showed the HIGH finding firing correctly
+(`[HIGH] Credential file read`, full report body). This bug predates
+today's session entirely — `action.yml`'s "Run wrapped command under
+Cordon" step has looked like this since the `github-action` feature was
+first built — and was never reproducible locally on this machine's
+WSL2 dev environment; it only surfaced once a real GitHub-hosted runner
+executed this exact step end-to-end fast enough to expose the timing
+window.
+
+**Root cause:**
+```bash
+"$CORDON_BIN" run sh -c "$CORDON_RUN_CMD" 2> >(tee "$CORDON_REPORT_FILE" >&2)
+status=$?
+if [ -s "$CORDON_REPORT_FILE" ]; then ...
+```
+`2> >(tee "$CORDON_REPORT_FILE" >&2)` is process substitution: bash
+forks `tee` as an asynchronous subshell reading from a pipe connected to
+the foreground command's stderr, and — unlike `$(...)` command
+substitution — does **not** wait for that subshell to finish before
+continuing to the next line. `status=$?` captures `cordon-bin`'s own
+exit code correctly (that part was never wrong), but the very next
+line's `[ -s "$CORDON_REPORT_FILE" ]` check can run before `tee` has
+finished writing and flushing the file to disk. On this job, the whole
+composite step completed in 32ms once the binary was built (per the
+Actions API's own `end-action` duration for that step) — fast enough
+that the race was lost: the file check saw it as empty (or not yet
+fully written) and the `>> "$GITHUB_STEP_SUMMARY"` block never ran, so
+the report that GitHub's own log capture clearly received (it reads the
+process's stderr FD directly, independent of our `tee`) never made it
+into the step summary our own verification step greps.
+
+**Why this test job is what caught it, and no earlier one did:**
+`benign-command` and `setup-node-path-forwarding` never write a report
+(no findings, so `-s "$CORDON_REPORT_FILE"` is false either way — a
+race on an empty file has no observable effect). Only a job whose
+wrapped command both (a) produces a finding worth writing to the
+summary and (b) had ever gotten far enough to run this step to
+completion could expose it — `high-finding-does-not-fail-the-step` is
+the only job in `action-selftest.yml` that does both, and it had never
+once reached this code path successfully before the AppArmor lift, on
+any of this session's earlier runs or (per `git log`) any run before
+this session existed at all.
+
+**Options considered:**
+- **Add an explicit `wait` after the command**, to block until the
+  process-substitution subshell finishes. Works in bash, but relies on
+  `wait`'s handling of process-substitution PIDs specifically (not
+  guaranteed obviously correct to a reader without knowing that detail)
+  and keeps the two-stream complexity (live tee + separate file) for no
+  remaining benefit once synchronous behavior is required anyway.
+- **Redirect stderr straight to the file, `cat` it back afterward**
+  (chosen). No process substitution, no subshell to race against: a
+  plain `2>"$CORDON_REPORT_FILE"` redirect is synchronous by
+  construction, so the file is guaranteed complete the instant the
+  command returns. Costs the live-streaming property — the report now
+  appears in the log only after the wrapped command finishes, instead
+  of interleaved with its stdout as it runs — accepted, since nothing
+  in `github-action/intent.md`'s Done checklist asks for interleaved
+  live output, only that stdout/stderr and the exit code end up
+  correct.
+
+**Chose:** Plain redirect (`2>"$CORDON_REPORT_FILE"` then
+`cat "$CORDON_REPORT_FILE" >&2`), replacing the process substitution
+entirely.
+
+**Verified not an isolated instance:** grepped the whole repository
+(`grep -rn ">(tee\|process substitution\|>(.*)"` across `.go`, `.yml`,
+`.yaml`, `.sh`) for the same `2> >(...)` pattern before considering this
+closed — `action.yml` line 85 (pre-fix) was the only match in the
+codebase. No other script or workflow carries the identical race.
+
+**Consequences:**
+- Easy: the fix is strictly simpler than what it replaces — one
+  redirect and one `cat`, no subshell, no timing dependency to reason
+  about at all, not just a narrower window.
+- Accepted: log output for the wrapped command's stderr (including the
+  behavior report) now appears after the command completes rather than
+  streamed live alongside its stdout. For a command that also produces
+  substantial stdout output, a reader watching the raw log in real time
+  loses interleaving they'd have had before — a real but minor
+  regression in log readability, not in correctness.
+- This is exactly the kind of bug INTENT.md's "an install must not take
+  noticeably longer... measured, not assumed" mandate — and CLAUDE.md's
+  "re-verify now, on this machine" instruction — exists to catch, except
+  this one was a *correctness* race no local re-run could have caught:
+  WSL2's timing characteristics for this exact code path never lost the
+  race in this session's or presumably any prior local testing, and the
+  bug was invisible until it ran on real GitHub-hosted infrastructure.
+  Worth remembering as a concrete, on-the-record example of why "tests
+  passed locally" was never trusted as sufficient for this feature.
+
+**If asked to defend this:** "This bug has been sitting in action.yml
+since the feature was first written — it's not something today's
+AppArmor work introduced, just something that work's fix finally let
+run far enough to expose, on a job fast enough to lose the race. Process
+substitution spawns an async subshell that bash doesn't wait for, so
+checking the file it's writing to on the very next line is inherently
+racy. The fix removes the race by construction — a synchronous redirect
+instead of a background tee — rather than papering over it with an
+explicit wait call whose correctness would depend on bash internals a
+future reader would have to already know. I grepped the whole repo for
+the same pattern before closing this out; it was the only instance."
+
+---
