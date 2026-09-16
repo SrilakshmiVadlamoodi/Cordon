@@ -41,17 +41,22 @@ it explicitly relies on it.
       assumed: a deliberately broken `cmd/cordon/main.go` reproduced a
       real build failure isolated to the build step (`go build` exit 1),
       restored before committing
-- [ ] A real end-to-end run on GitHub's hosted `ubuntu-latest` runner,
+- [x] A real end-to-end run on GitHub's hosted `ubuntu-latest` runner,
       via Cordon's own CI (Phase 3's separate "Cordon runs on Cordon's
       own CI" item, but the first real proof this Action works at all,
       not just that it's plausible) — specifically checks whether
       unprivileged user namespaces are available there or the AppArmor
       gate (INTENT.md §3, DECISIONS.md 2026-09-01) blocks it, rather
       than assuming either way
-      *(`.github/workflows/action-selftest.yml` written and its exact
-      shell logic verified locally against the real built binary; the
-      actual GitHub-hosted-runner result is only known once this
-      workflow runs in CI — left unchecked here until it does)*
+      *(confirmed: `ubuntu-latest` is AppArmor-gated by default
+      (DECISIONS.md 2026-09-14). Fixed with a best-effort, loud,
+      non-fatal sysctl lift in `action.yml`, plus two independent bugs
+      found and fixed only by iterating against the real runner — a
+      process-substitution race and `$GITHUB_STEP_SUMMARY` being scoped
+      per-step, not per-job (DECISIONS.md 2026-09-14, both entries).
+      All four `action-selftest.yml` jobs verified green on a real
+      runner before merge, and again on the first real `push`-to-`main`
+      trigger after merge.)*
 - [x] The wrapped command's own stdout/stderr, and Cordon's report,
       both appear in the workflow's job log in the natural order a plain
       `run:` step would already produce, unmodified — no re-formatting
