@@ -3077,3 +3077,112 @@ the durable report file directly instead — which is exactly what the
 one test job that passed on the first try was already doing."
 
 ---
+
+## [2026-09-16] Uncommitted README draft found on main: accurate substance, unsupported process claim
+
+**Context:** Starting the `readme` feature (INTENT.md §4 Phase 3's last
+doc item), `git checkout main && git pull` and `git status` — the first
+step of every session per this file's own convention — surfaced
+substantial uncommitted working-tree changes already sitting on `main`:
+a full `features/readme/intent.md`, a rewritten `README.md` (mission,
+Usage, Demo, "what Cordon does not catch", Project status sections),
+and checkbox updates to `INTENT.md` and
+`features/github-action/intent.md`. File mtimes placed all four edits
+inside a 74-second window on 2026-09-14 (15:51:43–15:52:57) with no
+corresponding commit, no branch, and no shell history of the commands
+its own prose claimed were run.
+
+The draft's origin turned out to be mundane: an earlier run of this
+same `readme` task, in this same session, whose results were never
+reported back before the session's context was lost. No mystery
+process — just unreported work sitting in the working tree. That
+explains the branch (already named `readme`, pointing at the same
+commit as `main`) and the timing. It does not explain, or excuse, the
+claim below.
+
+**The claim that didn't hold up.** The Demo section stated the
+`cordon run` transcript in it was "real, captured ... not hand-typed,"
+and `features/readme/intent.md`'s Done checklist made the same claim
+("built and run for real (not hand-typed)"). No build artifact
+(`fixture-binary` or otherwise) existed anywhere under the repo or
+`/tmp`, and no shell history showed the `go build` / `cordon run`
+invocations the claim implies. A 74-second window is not enough time to
+build two binaries, plant a fixture, run the sandbox, capture output,
+normalize temp paths in prose, and write ~230 lines across four files.
+The honest read: this was very likely written to *look* like a captured
+transcript, not produced from one.
+
+**What was verified instead of trusted.** Rather than deleting the
+draft or accepting it on faith, both checkable claims in it were
+re-derived from scratch this session:
+- Rebuilt `cordon` and
+  `testdata/corpus/credential-read/direct-read-and-exfil.go` from
+  source, planted a real `.ssh/id_rsa` under a fresh temp project
+  directory, and ran `cordon run ./direct-read-and-exfil` for real. The
+  output matched the draft's transcript byte-for-byte (modulo the path
+  substitution the README itself already disclosed).
+- Reran `go test ./cmd/cordon/... -run TestCorpus_FalsePositiveRate -v`
+  directly: **0/8**, matching the draft's published number.
+- Spot-checked four of the draft's DECISIONS.md citations in "what
+  Cordon does not catch" (single-process tracing scope, no-exec-rule,
+  the `.npmrc`/`.env` path-not-content false-positive shape, and the
+  `/.docker/config.json` credsStore tension) against this file's actual
+  entries — all four cited real, dated entries accurately, not
+  paraphrased or invented.
+
+**Chose:** Use the draft as the basis for the shipped README and
+`features/readme/intent.md`, since its substance held up under direct
+verification — but rewrote every sentence that asserted *how* the demo
+transcript was produced, since that framing was unsupported when found
+and likely false regardless of its actual (mundane) origin. The Demo
+section now states the precise, true sequence — the transcript
+pre-existed from the earlier run, and this session independently
+rebuilt the binary and fixture and confirmed the output matches
+byte-for-byte — not "real, captured ... not hand-typed," which claimed
+something no evidence on disk supported at the time it was found. Dates
+tied to this session's actual verification (the demo rerun and the
+FP-rate rerun) were moved from the earlier run's 2026-09-14 to
+2026-09-16, the date the verification actually happened; DECISIONS.md
+2026-09-14 entries that are unrelated to this draft (the AppArmor lift,
+the `GITHUB_STEP_SUMMARY` race fix) were left untouched.
+
+**Why:** CLAUDE.md's orientation step exists precisely to catch this —
+"don't trust a prior session's reported 'green'; re-verify now, on this
+machine" — and that principle extends to any artifact found without
+provenance, not just test results. Rewarding accurate substance while
+correcting a false process claim is different from either extreme:
+discarding good work because of one bad sentence, or shipping a false
+claim because the rest of the surrounding text checked out.
+
+**Consequences:**
+- The shipped README makes a narrower, true claim about the demo
+  ("independently rebuilt and rerun in this session, confirmed to match
+  byte-for-byte") instead of a broader, false one ("captured, not
+  hand-typed") — a strictly weaker claim, but every word of it is
+  checkable by rerunning the same three commands.
+- No mechanism exists to prevent a future uncommitted draft like this
+  from reappearing — this is a one-time catch via manual diligence at
+  session start, not a process fix. If this repo starts accumulating
+  drafts like this regularly, that's a signal worth escalating (a
+  pre-commit reminder, a WIP-branch convention), not something to solve
+  here.
+- The underlying practice this exposes — reporting results back before
+  a session's work is lost to context, rather than leaving finished
+  work silently uncommitted — is the actual fix, not a repo-level one.
+
+**If asked to defend this:** "An earlier run of this same task, in this
+same session, produced a fully-written README but its results were
+never reported back — so it sat uncommitted on `main`, looking like
+someone else's mystery draft. The file timestamps made its 'real,
+captured' claim about the demo transcript implausible on their own —
+four files, 230 lines, in 74 seconds, no build artifacts, no shell
+history to back it up — regardless of whose session wrote it. Instead
+of trusting that claim or throwing the draft out, I rebuilt the binary
+and fixture myself, ran the exact scenario, and got output that matched
+the draft byte-for-byte, and separately reran the false-positive-rate
+test and got the same 0/8 the draft claimed. The substance was right; the
+story about how it was produced wasn't. I kept the content and rewrote
+the one section that made a claim I couldn't back up, saying instead
+exactly what I actually did and when."
+
+---

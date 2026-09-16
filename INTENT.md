@@ -183,22 +183,40 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
       `features/corpus-expansion/intent.md`. Short of ~50; open question
       whether more categories/variants are still wanted.)*
 - [ ] Behavior taxonomy with written rationale per rule
-- [ ] Severity tiers; highest-value finding surfaces first
+- [x] Severity tiers; highest-value finding surfaces first
+      *(deviation, deliberate: no third numeric severity tier added —
+      the existing two-tier HIGH/MEDIUM split plus exfil-correlation
+      escalation already earns its keep; "highest-value finding surfaces
+      first" is instead satisfied via a confidence-based secondary sort
+      key beneath severity, so multiple simultaneous HIGHs render in a
+      deterministic, confidence-ordered sequence; see
+      `features/finding-confidence/intent.md` and DECISIONS.md
+      2026-09-11)*
 - [x] Allowlist mechanism for known-good patterns
       *(deviation, deliberate: exact developer-authored paths only, not
       patterns — a path pattern loose enough to cover a legitimate file
       is loose enough to cover a malicious one at a similarly-shaped
       path; see `features/allowlist-mechanism/intent.md` "Why not
       globs" and DECISIONS.md 2026-09-11)*
-- [ ] False-positive rate measured and published in README
+- [x] False-positive rate measured and published in README
+      *(0/8 on Cordon's own synthetic benign-archetype corpus, published
+      in README.md; see `features/false-positive-rate/intent.md` and
+      DECISIONS.md 2026-09-11)*
 
 ### Phase 3 — Distribution
 
-- [ ] GitHub Action wrapper (three lines in a workflow file)
+- [x] GitHub Action wrapper (three lines in a workflow file)
+      *(merged to `main`; verified end-to-end on a real GitHub-hosted
+      `ubuntu-latest` runner, including two independently-found and
+      fixed bugs only a live runner surfaced — see
+      `features/github-action/intent.md` and DECISIONS.md 2026-09-14)*
 - [ ] `goreleaser` binaries on GitHub Releases
 - [ ] README with demo, FP numbers, and an explicit list of what Cordon
       does not catch
-- [ ] Cordon runs on Cordon's own CI
+      *(in progress — see `features/readme/intent.md`)*
+- [x] Cordon runs on Cordon's own CI
+      *(`action-selftest.yml` runs on every push to `main`; confirmed
+      green after the `github-action` merge, DECISIONS.md 2026-09-14)*
 
 ### Phase 4 — Reach
 
