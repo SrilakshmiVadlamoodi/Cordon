@@ -3186,3 +3186,76 @@ the one section that made a claim I couldn't back up, saying instead
 exactly what I actually did and when."
 
 ---
+
+## [2026-09-24] goreleaser release matrix: omit arm64 entirely, ship binaries before touching the Action
+
+**Context:** Phase 3's last item (INTENT.md §4) is `goreleaser`
+binaries on GitHub Releases. Two real forks: what the release matrix
+covers, and whether this feature also swaps the GitHub Action from
+compiling Cordon from source on every run to downloading the released
+binary instead.
+
+**Options considered (matrix):**
+- List `linux/arm64` in `.goreleaser.yml` and let the existing
+  compile-time build tag (DECISIONS.md 2026-09-05, "arm64 build tag:
+  fail the build, not the runtime" — `internal/syscallcapture` fails to
+  compile on arm64 because ptrace register access is amd64-specific)
+  fail that one matrix leg, with an `ignore` carve-out so the rest of
+  the release still publishes.
+- Omit `arm64` from the `goarch` list entirely — no leg is attempted,
+  nothing to fail.
+
+**Chose:** omit it entirely. `.goreleaser.yml`'s `builds.goarch` lists
+only `amd64`; no macOS/Windows either (permanent non-goal, INTENT.md
+§3).
+
+**Why:** a GitHub Release page that lists a `cordon_linux_arm64.tar.gz`
+asset which then either 404s or was silently never uploaded because its
+build leg failed is the same "ship a broken binary" failure mode as not
+having the arm64 build tag at all — just surfacing as a missing file
+instead of a non-compiling one. Nothing in INTENT.md commits to an
+arm64 timeline (the 2026-09-05 entry explicitly deferred it,
+unscheduled), so there's no roadmap reason to keep a visibly-broken row
+in the matrix. Confirmed with the user before implementing (not
+defaulted).
+
+**Options considered (Action integration):**
+- Swap the composite Action to download the pinned release binary
+  matching its own ref, instead of running `go build` in the
+  consumer's CI job every time. Removes the Action's per-run compile
+  cost and gives every consumer an identical, checksummed artifact.
+- Ship goreleaser binaries as an independent distribution path only;
+  leave the Action's "compile from source" step untouched for now.
+
+**Chose:** the latter — ship binaries first, leave the Action alone.
+
+**Why:** the Action's current behavior is hard-won and already verified
+end-to-end on a real `ubuntu-latest` runner across two independently
+found bugs (features/github-action/intent.md, DECISIONS.md 2026-09-14).
+Swapping it to a download-based flow needs its own real answer for what
+`uses: SrilakshmiVadlamoodi/cordon@main` (an untagged ref) should do
+when no release exists for that exact commit — fall back to a source
+build, or require a tagged ref — and that design question shouldn't be
+decided as a side effect of shipping the first release binary. Confirmed
+with the user before implementing.
+
+**Consequences:** binaries exist and are installable/downloadable
+independent of the Action, closing Phase 3. The Action's per-run
+compile cost is *not* addressed by this feature — a real follow-up
+feature is still needed to actually change what the Action does, and
+until that lands, "goreleaser binaries exist" and "the Action still
+compiles from source every run" are both true at once; a reader of the
+README needs both facts stated accurately, not one implying the other
+is resolved.
+
+**If asked to defend this:** "We ship the release binaries as a second,
+independent way to get Cordon — separate from the Action, which still
+compiles from source for now. arm64 isn't in the matrix at all, because
+it can't produce a working binary today; listing it and letting it fail
+would just turn a missing-file problem into a broken-file problem. And
+we deliberately didn't fold the Action-download swap into this same
+change, because that's a separate design decision — what an untagged
+ref should resolve to — that deserved its own scrutiny instead of
+riding along."
+
+---

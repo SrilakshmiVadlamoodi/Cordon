@@ -6,3 +6,6 @@
 *.exe
 *.test
 *.out
+
+# goreleaser output
+/dist/

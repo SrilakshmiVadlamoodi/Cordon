@@ -1,0 +1,43 @@
+version: 2
+
+project_name: cordon
+
+builds:
+  - id: cordon
+    main: ./cmd/cordon
+    binary: cordon
+    goos:
+      - linux
+    goarch:
+      - amd64
+    # arm64 is deliberately absent, not listed-and-ignored: it cannot
+    # produce a working binary today. internal/syscallcapture fails to
+    # compile on arm64 by design (DECISIONS.md 2026-09-05, "arm64 build
+    # tag: fail the build, not the runtime") because ptrace register
+    # access is amd64-specific and no arm64 equivalent is implemented.
+    # A listed-but-failing matrix leg would either abort the whole
+    # release or require an `ignore` carve-out that produces no asset
+    # anyway -- omitting it here is the same end state without the risk
+    # of a partial/broken release.
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: cordon
+    ids:
+      - cordon
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+# No macOS/Windows builds -- permanent non-goal (INTENT.md §3 Platform).
+# No arm64 -- see builds.goarch comment above.
