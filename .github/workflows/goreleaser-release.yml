@@ -1,0 +1,40 @@
+name: goreleaser release
+
+# The real, tag-triggered release path. Deliberately a separate file
+# from goreleaser-snapshot.yml (push/PR/workflow_dispatch,
+# --snapshot --clean, never publishes) so the two can never be
+# confused: this workflow only runs on an actual `v*` tag push, and it
+# publishes a real public GitHub Release with real binaries attached.
+# features/goreleaser-binaries/intent.md scoped cutting a real tag as
+# an explicit, separately-confirmed step -- this file is that step's
+# trigger, added and validated ahead of the first real tag, not
+# discovered missing after one was pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run goreleaser release (publishes to GitHub Releases)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
