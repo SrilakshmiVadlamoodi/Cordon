@@ -36,7 +36,12 @@ daemon, and no sudo.
   [What Cordon does not catch](#what-cordon-does-not-catch) below.
 
 See [INTENT.md](INTENT.md) for the full mission, architecture, and
-roadmap.
+roadmap. See [DEVLOG.md](DEVLOG.md) for a curated account of the real
+bugs found, tradeoffs made, and limitations accepted along the way —
+several are cited by date throughout this README as `DECISIONS.md
+<date>`, which refers to the maintainer's local, uncurated decision log
+(not tracked in this repo as of 2026-09-24); DEVLOG.md is the published
+version of that same material.
 
 ## Usage
 
