@@ -1,0 +1,73 @@
+name: goreleaser snapshot
+
+# Validates .goreleaser.yml on GitHub's hosted ubuntu-latest runner --
+# the same runner class action-selftest.yml already proved viable for
+# Cordon's own build/run requirements. Deliberately snapshot-only: no
+# git tag is cut, no GitHub Release is published, nothing leaves this
+# job. Cutting a real, tag-triggered release is a separate, explicitly
+# confirmed step (features/goreleaser-binaries/intent.md), not wired
+# here.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.goreleaser.yml'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/goreleaser-snapshot.yml'
+  pull_request:
+    paths:
+      - '.goreleaser.yml'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/goreleaser-snapshot.yml'
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run goreleaser in snapshot mode (no tag, no publish)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --snapshot --clean
+
+      - name: Verify exactly one linux/amd64 archive was built, no arm64
+        run: |
+          shopt -s nullglob
+          archives=(dist/*_linux_amd64.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one linux_amd64 archive in dist/, found ${#archives[@]}: ${archives[*]}"
+            exit 1
+          fi
+
+          arm64_archives=(dist/*_linux_arm64.tar.gz)
+          if [ "${#arm64_archives[@]}" -ne 0 ]; then
+            echo "::error::found an arm64 archive -- arm64 must be omitted from the release matrix (DECISIONS.md 2026-09-05, arm64 fails to compile by design): ${arm64_archives[*]}"
+            exit 1
+          fi
+
+          echo "Confirmed: ${archives[0]} built, no arm64 artifact produced."
+
+      - name: Verify the built binary actually runs
+        run: |
+          tmp="$(mktemp -d)"
+          tar -xzf dist/*_linux_amd64.tar.gz -C "$tmp"
+          "$tmp/cordon" 2>&1 | grep -q "usage: cordon run" || {
+            echo "::error::built binary did not produce the expected usage output"
+            exit 1
+          }
+          echo "Confirmed: extracted binary runs and prints usage."
