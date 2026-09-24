@@ -67,13 +67,17 @@ stderr after the command finishes.
 ```
 
 Compiles Cordon from source on each run (`go build`, pinned to this
-repo's own `go.mod` Go version — no released binaries exist yet, see
+repo's own `go.mod` Go version, see
 [`features/github-action/intent.md`](features/github-action/intent.md)),
 runs the given command inside the sandbox, and appends the behavior
 report to the job's step summary. Linux runners only (`ubuntu-latest`),
 per INTENT.md §3. Verified end-to-end on a real hosted runner, including
 a best-effort fix for Ubuntu 24.04's default AppArmor restriction on
-unprivileged user namespaces (DECISIONS.md 2026-09-14).
+unprivileged user namespaces (DECISIONS.md 2026-09-14). A `linux/amd64`
+release build (`goreleaser`) exists and is validated in CI, but no
+tagged GitHub Release has been cut yet, so this Action does not yet
+download a pre-built binary instead of compiling — see
+[`features/goreleaser-binaries/intent.md`](features/goreleaser-binaries/intent.md).
 
 ## Demo
 
@@ -263,9 +267,15 @@ summary.
   `features/corpus-expansion/intent.md`.
 - **Phase 3 (distribution) — in progress.** The GitHub Action is merged
   and verified end-to-end on a real hosted runner; Cordon now runs on
-  its own CI; this README is the last doc item. `goreleaser` binaries on
-  GitHub Releases are not yet built — today's Action compiles Cordon
-  from source on every invocation.
+  its own CI; this README shipped. The `goreleaser` release matrix
+  (`linux/amd64` only — `arm64` deliberately excluded, see
+  [What Cordon does not catch](#what-cordon-does-not-catch) below and
+  DECISIONS.md 2026-09-05) is built and validated in CI via snapshot
+  builds, but no tagged release has been cut yet, so there is still no
+  downloadable binary on GitHub Releases. The Action still compiles
+  Cordon from source on every invocation — swapping it to download the
+  release binary instead is a deliberate follow-up, not bundled into
+  shipping the release matrix (DECISIONS.md 2026-09-24).
 - **Phase 4 (reach) — not started.** pip/`setup.py` support,
   cross-version behavioral baselines, an eBPF evaluation.
 - **Phase 5 (tree tracing) — deferred, no committed timeline.**
