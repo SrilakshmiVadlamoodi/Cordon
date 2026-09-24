@@ -211,9 +211,9 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
       fixed bugs only a live runner surfaced — see
       `features/github-action/intent.md` and DECISIONS.md 2026-09-14)*
 - [ ] `goreleaser` binaries on GitHub Releases
-- [ ] README with demo, FP numbers, and an explicit list of what Cordon
+- [x] README with demo, FP numbers, and an explicit list of what Cordon
       does not catch
-      *(in progress — see `features/readme/intent.md`)*
+      *(merged to `main` 2026-09-16 — see `features/readme/intent.md`)*
 - [x] Cordon runs on Cordon's own CI
       *(`action-selftest.yml` runs on every push to `main`; confirmed
       green after the `github-action` merge, DECISIONS.md 2026-09-14)*
