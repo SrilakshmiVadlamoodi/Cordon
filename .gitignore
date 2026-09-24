@@ -9,3 +9,7 @@
 
 # goreleaser output
 /dist/
+
+# Local-only reference file as of 2026-09-24 -- see its own final entry.
+# Not scrubbed from git history; just no longer tracked or updated.
+/DECISIONS.md
