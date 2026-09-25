@@ -210,7 +210,11 @@ plain-text report (to **stderr** — the wrapped command owns stdout; see
       `ubuntu-latest` runner, including two independently-found and
       fixed bugs only a live runner surfaced — see
       `features/github-action/intent.md` and DECISIONS.md 2026-09-14)*
-- [ ] `goreleaser` binaries on GitHub Releases
+- [x] `goreleaser` binaries on GitHub Releases
+      *(`v0.1.0` tagged and released 2026-09-25 — `linux/amd64` only,
+      `arm64` deliberately excluded, see DEVLOG.md; release matrix
+      validated via tag-triggered CI before the real tag was cut, see
+      `features/goreleaser-binaries/intent.md`)*
 - [x] README with demo, FP numbers, and an explicit list of what Cordon
       does not catch
       *(merged to `main` 2026-09-16 — see `features/readme/intent.md`)*

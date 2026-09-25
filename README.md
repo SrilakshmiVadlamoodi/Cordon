@@ -66,7 +66,7 @@ stderr after the command finishes.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: SrilakshmiVadlamoodi/cordon@main   # pin to a commit SHA until a tagged release exists
+- uses: SrilakshmiVadlamoodi/cordon@v0.1.0   # or @main for latest, less stable
   with:
     run: npm ci
 ```
@@ -78,11 +78,14 @@ runs the given command inside the sandbox, and appends the behavior
 report to the job's step summary. Linux runners only (`ubuntu-latest`),
 per INTENT.md §3. Verified end-to-end on a real hosted runner, including
 a best-effort fix for Ubuntu 24.04's default AppArmor restriction on
-unprivileged user namespaces (DECISIONS.md 2026-09-14). A `linux/amd64`
-release build (`goreleaser`) exists and is validated in CI, but no
-tagged GitHub Release has been cut yet, so this Action does not yet
-download a pre-built binary instead of compiling — see
+unprivileged user namespaces (DECISIONS.md 2026-09-14). A tagged release
+exists — [`v0.1.0`][release] ships a `linux/amd64` binary, downloadable
+independent of the Action — but the Action itself still compiles from
+source on every run rather than fetching that binary; swapping it over
+is a deliberate, separate follow-up, not yet done — see
 [`features/goreleaser-binaries/intent.md`](features/goreleaser-binaries/intent.md).
+
+[release]: https://github.com/SrilakshmiVadlamoodi/Cordon/releases/tag/v0.1.0
 
 ## Demo
 
@@ -270,17 +273,17 @@ summary.
   breadth (~16 fixtures across 9 archetypes, short of the roadmap's
   "~50 packages" framing) is an open question, not a gap — see
   `features/corpus-expansion/intent.md`.
-- **Phase 3 (distribution) — in progress.** The GitHub Action is merged
-  and verified end-to-end on a real hosted runner; Cordon now runs on
-  its own CI; this README shipped. The `goreleaser` release matrix
-  (`linux/amd64` only — `arm64` deliberately excluded, see
+- **Phase 3 (distribution) — complete against the roadmap as written.**
+  The GitHub Action is merged and verified end-to-end on a real hosted
+  runner; Cordon runs on its own CI; this README shipped;
+  [`v0.1.0`][release] is tagged and released, with a `linux/amd64`
+  binary attached (`arm64` deliberately excluded, see
   [What Cordon does not catch](#what-cordon-does-not-catch) below and
-  DECISIONS.md 2026-09-05) is built and validated in CI via snapshot
-  builds, but no tagged release has been cut yet, so there is still no
-  downloadable binary on GitHub Releases. The Action still compiles
-  Cordon from source on every invocation — swapping it to download the
-  release binary instead is a deliberate follow-up, not bundled into
-  shipping the release matrix (DECISIONS.md 2026-09-24).
+  DEVLOG.md). One thing the roadmap didn't ask for but is worth stating
+  plainly: the GitHub Action still compiles Cordon from source on every
+  invocation rather than downloading the released binary — that swap is
+  a deliberate, separate follow-up (DEVLOG.md), not something Phase 3's
+  own checklist required.
 - **Phase 4 (reach) — not started.** pip/`setup.py` support,
   cross-version behavioral baselines, an eBPF evaluation.
 - **Phase 5 (tree tracing) — deferred, no committed timeline.**
